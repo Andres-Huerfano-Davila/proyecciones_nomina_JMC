@@ -674,7 +674,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="big-title">💼 Modelo financiero de nómina JMC</div>', unsafe_allow_html=True)
+st.markdown('<div class="big-title">💼 Modelo proyecciones de nómina JMC</div>', unsafe_allow_html=True)
 st.markdown('<div class="subtitle">MVP 3 · Calcula conceptos básicos de nómina, ingresos proyectados, ausentismos y homologación DKON por CECO.</div>', unsafe_allow_html=True)
 
 with st.sidebar:
