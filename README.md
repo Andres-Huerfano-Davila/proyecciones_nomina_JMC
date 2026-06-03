@@ -1,31 +1,28 @@
-# Proyección Costos JMC - MVP 2
+# Modelo financiero nómina JMC - MVP 3
 
-Esta versión incluye:
+Este MVP calcula una primera base financiera de nómina:
 
-- Carga de Dkon.
-- Carga de MD Mes Anterior.
-- Carga de MD Actual.
-- Matriz DKON de conceptos Y.
-- Clasificación CECO: 101 = Tiendas, 102 = Logística/CEDIS, 103 = Admon.
-- Base detalle por concepto Y.
-- Base por cuenta DKON.
-- Comparativo MD anterior vs actual.
-- Resumen de movimiento de planta.
-- Alertas.
+- Lee DKON y filtra conceptos Y.
+- Lee MD mes actual.
+- Calcula conceptos básicos de nómina: Y010, Y011, Y020, Y050, Y051, Y090.
+- Calcula auxilio de transporte Y200 según salario y días pagados.
+- Descuenta días de ausentismo si se carga el archivo.
+- Proyecta ingresos desde archivo de reclutamiento si se carga.
+- Homologa cada concepto a cuenta DKON usando Concepto + Tipo CECO.
+- Genera detalle por concepto y agrupado por cuenta.
 
-## Archivos necesarios
+## Archivos mínimos
 
-1. `Dkon.XLSX`
-2. `MES_ANT.xlsx`
-3. `MD_ACTUAL.xlsx`
+- DKON
+- MD mes actual
 
-## Streamlit Cloud
+## Archivos opcionales
 
-Se incluye `runtime.txt` con `python-3.12` para evitar errores de instalación con Python 3.14 y paquetes como Pillow/pandas.
+- MD mes anterior
+- Ingresos reclutamiento
+- Proyección ausentismos
 
-## Ejecución local
+## Despliegue Streamlit Cloud
 
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+Main file path: `app.py`
+Python: 3.12
