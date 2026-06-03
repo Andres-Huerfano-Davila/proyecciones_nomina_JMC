@@ -1,38 +1,29 @@
-# Proyección de Costos JMC - MVP 1
+# Proyección Costos JMC - MVP 2
 
-Primera versión del motor base para convertir conceptos de nómina `Y` en cuentas DKON según el tipo de CECO.
+Esta versión incluye:
 
-## Regla central
+- Carga de Dkon.
+- Carga de MD Mes Anterior.
+- Carga de MD Actual.
+- Matriz DKON de conceptos Y.
+- Clasificación CECO: 101 = Tiendas, 102 = Logística/CEDIS, 103 = Admon.
+- Base detalle por concepto Y.
+- Base por cuenta DKON.
+- Comparativo MD anterior vs actual.
+- Resumen de movimiento de planta.
+- Alertas.
 
-- CECO `101xxxxx` = Tiendas -> cuentas `60...`
-- CECO `102xxxxx` = Logística/CEDIS -> cuentas `62...`
-- CECO `103xxxxx` = Admon -> cuentas `63...`
-
-La homologación se hace por:
-
-```text
-Concepto Y + Tipo CECO = Cuenta DKON
-```
-
-## Archivos de entrada mínimos
+## Archivos necesarios
 
 1. `Dkon.XLSX`
-2. `MD_ACTUAL.xlsx`
+2. `MES_ANT.xlsx`
+3. `MD_ACTUAL.xlsx`
 
-## Salida
+## Streamlit Cloud
 
-El aplicativo genera un Excel con estas hojas:
+Se incluye `runtime.txt` con `python-3.12` para evitar errores de instalación con Python 3.14 y paquetes como Pillow/pandas.
 
-- `MATRIZ_DKON_Y`
-- `MD_NORMALIZADO_Y`
-- `BASE_CONCEPTOS_Y`
-- `BASE_CUENTAS_DKON`
-- `RESUMEN_TIPO_CECO`
-- `RESUMEN_CUENTA`
-- `RESUMEN_CECO`
-- `ALERTAS`
-
-## Cómo correr localmente
+## Ejecución local
 
 ```bash
 pip install -r requirements.txt

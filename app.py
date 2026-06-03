@@ -8,9 +8,10 @@ import pandas as pd
 import streamlit as st
 
 # =====================================================
-# PROYECCIÓN COSTOS - MVP 1
-# Motor base: DKON + MD Actual -> Base concepto Y + Base cuenta
-# Creado para estructurar costo de personal por empleado, concepto, CECO y cuenta financiera.
+# PROYECCIÓN COSTOS JMC - MVP 2
+# Motor base: DKON + MD Mes Anterior + MD Actual
+# Objetivo: construir base detalle por concepto Y, base por cuenta DKON
+# y comparativo de planta entre MD anterior y MD actual.
 # =====================================================
 
 st.set_page_config(
@@ -59,7 +60,6 @@ def clean_code(x):
     if pd.isna(x):
         return ""
     x = str(x).strip().upper()
-    # Evita que códigos enteros salgan como 60000001.0
     if re.fullmatch(r"\d+\.0", x):
         x = x[:-2]
     return x
@@ -75,7 +75,7 @@ def clean_ceco(x):
 
 
 def to_number(value):
-    """Convierte valores como '1.750.905', '1,750,905', '$ 1.750.905' a número."""
+    """Convierte '1.750.905', '1,750,905', '$ 1.750.905' a número."""
     if pd.isna(value):
         return 0.0
     if isinstance(value, (int, float, np.integer, np.floating)):
@@ -84,14 +84,12 @@ def to_number(value):
     if not s:
         return 0.0
     s = s.replace("$", "").replace("COP", "").replace(" ", "")
-    # Si viene con formato colombiano: 1.750.905,50
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
         else:
             s = s.replace(",", "")
     elif "." in s and "," not in s:
-        # Si todos los grupos después del punto tienen 3 dígitos, son miles
         parts = s.split(".")
         if len(parts) > 1 and all(len(p) == 3 for p in parts[1:]):
             s = s.replace(".", "")
@@ -131,6 +129,7 @@ def clasificar_tipo_cuenta(cuenta):
 
 
 def find_sheet_name(uploaded_file, preferred_names):
+    uploaded_file.seek(0)
     xls = pd.ExcelFile(uploaded_file)
     norm_map = {norm_col(s): s for s in xls.sheet_names}
     for name in preferred_names:
@@ -140,24 +139,12 @@ def find_sheet_name(uploaded_file, preferred_names):
     return xls.sheet_names[0]
 
 
-def read_excel_any(uploaded_file, preferred_sheet=None, dtype=str):
-    uploaded_file.seek(0)
-    if preferred_sheet:
-        sheet = find_sheet_name(uploaded_file, [preferred_sheet])
-    else:
-        sheet = 0
-    uploaded_file.seek(0)
-    return pd.read_excel(uploaded_file, sheet_name=sheet, dtype=dtype)
-
-
 def pick_col(df, candidates, required=True):
-    """Busca una columna por candidatos aproximados normalizados."""
     col_map = {norm_col(c): c for c in df.columns}
     for cand in candidates:
         n = norm_col(cand)
         if n in col_map:
             return col_map[n]
-    # búsqueda parcial
     for cand in candidates:
         n = norm_col(cand)
         for k, v in col_map.items():
@@ -167,12 +154,17 @@ def pick_col(df, candidates, required=True):
         raise ValueError(f"No encontré columna requerida. Candidatas: {candidates}")
     return None
 
+
+def safe_series(df, col, default=""):
+    if col and col in df.columns:
+        return df[col].fillna("").astype(str).str.strip()
+    return pd.Series([default] * len(df), index=df.index)
+
 # ----------------------------
 # DKON
 # ----------------------------
 
 def construir_matriz_dkon(dkon_file):
-    dkon_file.seek(0)
     sh = find_sheet_name(dkon_file, ["Sheet1"])
     dkon_file.seek(0)
     df = pd.read_excel(dkon_file, sheet_name=sh, dtype=str)
@@ -193,10 +185,10 @@ def construir_matriz_dkon(dkon_file):
     matriz = matriz[matriz["Cuenta_DKON"].str.match(r"^(60|62|63)\d+", na=False)].copy()
     matriz["Tipo_CECO"] = matriz["Cuenta_DKON"].map(clasificar_tipo_cuenta)
 
-    matriz["Descripcion_Concepto"] = matriz[col_texto_concepto] if col_texto_concepto else ""
-    matriz["Texto_Cuenta"] = matriz[col_texto_cuenta] if col_texto_cuenta else ""
-    matriz["Grupo_DKON"] = matriz[col_grupo] if col_grupo else ""
-    matriz["Descripcion_DKON"] = matriz[col_descripcion] if col_descripcion else ""
+    matriz["Descripcion_Concepto"] = safe_series(matriz, col_texto_concepto)
+    matriz["Texto_Cuenta"] = safe_series(matriz, col_texto_cuenta)
+    matriz["Grupo_DKON"] = safe_series(matriz, col_grupo)
+    matriz["Descripcion_DKON"] = safe_series(matriz, col_descripcion)
 
     matriz = matriz[[
         "Concepto",
@@ -211,19 +203,17 @@ def construir_matriz_dkon(dkon_file):
     for c in matriz.columns:
         matriz[c] = matriz[c].fillna("").astype(str).str.strip()
 
-    # Hay duplicados naturales por Administrativos/Ejecutivos que terminan en la misma cuenta 63.
     matriz = matriz.drop_duplicates(subset=["Concepto", "Tipo_CECO"], keep="first")
     matriz["Llave_DKON"] = matriz["Tipo_CECO"] + "|" + matriz["Concepto"]
 
     return matriz.sort_values(["Concepto", "Tipo_CECO"]).reset_index(drop=True)
 
 # ----------------------------
-# MD Actual
+# MD
 # ----------------------------
 
-def leer_md_normalizado(md_file):
-    md_file.seek(0)
-    # Preferimos Salario_Bono_Vigente porque trae cada concepto Y con importe.
+def leer_md_conceptos(md_file, fuente="MD Actual"):
+    """Lee Salario_Bono_Vigente para obtener detalle por concepto Y."""
     sh = find_sheet_name(md_file, ["Salario_Bono_Vigente", "Consolidado__Base"])
     md_file.seek(0)
     df = pd.read_excel(md_file, sheet_name=sh, dtype=str)
@@ -239,51 +229,173 @@ def leer_md_normalizado(md_file):
     col_concepto = pick_col(df, ["CC-nómina", "CC nomina", "Concepto"])
     col_desc_concepto = pick_col(df, ["CC-nómina_2", "CC nomina_2", "Texto concepto"], required=False)
     col_importe = pick_col(df, ["Importe", "Salario Total", "Valor"], required=False)
-    col_salario_total = pick_col(df, ["Salario Total", "Salario_total"], required=False)
     col_nivel = pick_col(df, ["Gr.prof.", "Gr prof", "Nivel"], required=False)
     col_division = pick_col(df, ["División de personal", "Division de personal"], required=False)
     col_regional = pick_col(df, ["Encargado para registro de tie", "Regional"], required=False)
+    col_id = pick_col(df, ["Número ID", "Numero ID", "Cedula", "Cédula"], required=False)
 
     out = pd.DataFrame()
     out["SAP"] = df[col_sap].map(clean_code)
-    out["Nombre"] = df[col_nombre].fillna("").astype(str).str.strip() if col_nombre else ""
-    out["Status"] = df[col_status].fillna("").astype(str).str.strip() if col_status else ""
-    out["Area_Nomina"] = df[col_area_nomina].fillna("").astype(str).str.strip() if col_area_nomina else ""
+    out["Nombre"] = safe_series(df, col_nombre)
+    out["Status"] = safe_series(df, col_status)
+    out["Area_Nomina"] = safe_series(df, col_area_nomina)
     out["CECO"] = df[col_ceco].map(clean_ceco)
-    out["Centro_Coste"] = df[col_centro].fillna("").astype(str).str.strip() if col_centro else ""
+    out["Centro_Coste"] = safe_series(df, col_centro)
     out["Tipo_CECO"] = out["CECO"].map(clasificar_tipo_ceco)
-    out["Cargo"] = df[col_funcion].fillna("").astype(str).str.strip() if col_funcion else ""
-    out["Nivel"] = df[col_nivel].fillna("").astype(str).str.strip() if col_nivel else ""
-    out["Division_Personal"] = df[col_division].fillna("").astype(str).str.strip() if col_division else ""
-    out["Regional"] = df[col_regional].fillna("").astype(str).str.strip() if col_regional else ""
+    out["Cargo"] = safe_series(df, col_funcion)
+    out["Nivel"] = safe_series(df, col_nivel)
+    out["Division_Personal"] = safe_series(df, col_division)
+    out["Regional"] = safe_series(df, col_regional)
+    out["Numero_ID"] = safe_series(df, col_id)
     out["Concepto"] = df[col_concepto].map(clean_code)
-    out["Descripcion_Concepto_MD"] = df[col_desc_concepto].fillna("").astype(str).str.strip() if col_desc_concepto else ""
-    if col_importe:
-        out["Valor"] = df[col_importe].map(to_number)
-    elif col_salario_total:
-        out["Valor"] = df[col_salario_total].map(to_number)
-    else:
-        out["Valor"] = 0.0
+    out["Descripcion_Concepto_MD"] = safe_series(df, col_desc_concepto)
+    out["Valor"] = df[col_importe].map(to_number) if col_importe else 0.0
+    out["Fuente"] = fuente
 
-    # Solo conceptos Y.
     out = out[out["Concepto"].str.startswith("Y", na=False)].copy()
     out = out[out["SAP"].ne("")].copy()
-
     return out.reset_index(drop=True)
 
 
-def crear_base_conceptos(md_norm, periodo, fuente="MD Actual"):
-    base = md_norm.copy()
+def leer_md_dimension(md_file, etiqueta="Actual"):
+    """Lee Consolidado__Base para obtener una fila por SAP para comparativo de planta."""
+    sh = find_sheet_name(md_file, ["Consolidado__Base", "Salario_Bono_Vigente"])
+    md_file.seek(0)
+    df = pd.read_excel(md_file, sheet_name=sh, dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    col_sap = pick_col(df, ["Nº pers.", "N° pers.", "No pers", "SAP", "Número de personal"])
+    col_nombre = pick_col(df, ["Número de personal", "Nombre"], required=False)
+    col_status = pick_col(df, ["Status ocupación", "Status ocupacion"], required=False)
+    col_area_nomina = pick_col(df, ["Área de nómina", "Area de nomina"], required=False)
+    col_ceco = pick_col(df, ["Ce.coste", "Ce coste", "Centro costo", "Centro de costo"])
+    col_centro = pick_col(df, ["Centro de coste", "Centro de costo"], required=False)
+    col_funcion = pick_col(df, ["Función_2", "Funcion_2", "Función", "Funcion", "Cargo", "Posición_2"], required=False)
+    col_salario = pick_col(df, ["Salario Total", "salario_total", "Importe", "Valor"], required=False)
+    col_nivel = pick_col(df, ["Gr.prof.", "Gr prof", "Nivel"], required=False)
+    col_division = pick_col(df, ["División de personal", "Division de personal"], required=False)
+    col_regional = pick_col(df, ["Encargado para registro de tie", "Regional"], required=False)
+    col_id = pick_col(df, ["Número ID", "Numero ID", "Cedula", "Cédula"], required=False)
+
+    out = pd.DataFrame()
+    out["SAP"] = df[col_sap].map(clean_code)
+    out["Nombre"] = safe_series(df, col_nombre)
+    out["Status"] = safe_series(df, col_status)
+    out["Area_Nomina"] = safe_series(df, col_area_nomina)
+    out["CECO"] = df[col_ceco].map(clean_ceco)
+    out["Centro_Coste"] = safe_series(df, col_centro)
+    out["Tipo_CECO"] = out["CECO"].map(clasificar_tipo_ceco)
+    out["Cargo"] = safe_series(df, col_funcion)
+    out["Nivel"] = safe_series(df, col_nivel)
+    out["Division_Personal"] = safe_series(df, col_division)
+    out["Regional"] = safe_series(df, col_regional)
+    out["Numero_ID"] = safe_series(df, col_id)
+    out["Salario_Total"] = df[col_salario].map(to_number) if col_salario else 0.0
+    out = out[out["SAP"].ne("")].copy()
+
+    # Si por alguna razón hay más de una fila por SAP, se conserva la primera fila no vacía.
+    out = out.sort_values(["SAP"]).drop_duplicates(subset=["SAP"], keep="first").reset_index(drop=True)
+    out["Etiqueta_MD"] = etiqueta
+    return out
+
+
+def crear_base_conceptos(md_conceptos, periodo):
+    base = md_conceptos.copy()
     base.insert(0, "Periodo", periodo)
-    base["Fuente"] = fuente
     base["Llave_DKON"] = base["Tipo_CECO"] + "|" + base["Concepto"]
     cols = [
         "Periodo", "SAP", "Nombre", "Status", "Area_Nomina", "CECO", "Centro_Coste", "Tipo_CECO",
-        "Cargo", "Nivel", "Division_Personal", "Regional", "Concepto", "Descripcion_Concepto_MD",
+        "Cargo", "Nivel", "Division_Personal", "Regional", "Numero_ID", "Concepto", "Descripcion_Concepto_MD",
         "Valor", "Fuente", "Llave_DKON"
     ]
     return base[cols].copy()
 
+# ----------------------------
+# Comparativo MD
+# ----------------------------
+
+def construir_comparativo_md(md_ant_dim, md_act_dim):
+    ant = md_ant_dim.rename(columns={c: f"{c}_ANT" for c in md_ant_dim.columns if c not in ["SAP"]})
+    act = md_act_dim.rename(columns={c: f"{c}_ACT" for c in md_act_dim.columns if c not in ["SAP"]})
+    comp = ant.merge(act, on="SAP", how="outer", indicator=True)
+
+    def estado(row):
+        if row["_merge"] == "left_only":
+            return "No está en MD actual"
+        if row["_merge"] == "right_only":
+            return "Nuevo en MD actual"
+        return "Continúa"
+
+    comp["Estado_Planta"] = comp.apply(estado, axis=1)
+
+    def neq(a, b):
+        a = "" if pd.isna(a) else str(a).strip()
+        b = "" if pd.isna(b) else str(b).strip()
+        return a != b
+
+    comp["Cambio_CECO"] = comp.apply(lambda r: r["Estado_Planta"] == "Continúa" and neq(r.get("CECO_ANT"), r.get("CECO_ACT")), axis=1)
+    comp["Cambio_Tipo_CECO"] = comp.apply(lambda r: r["Estado_Planta"] == "Continúa" and neq(r.get("Tipo_CECO_ANT"), r.get("Tipo_CECO_ACT")), axis=1)
+    comp["Cambio_Cargo"] = comp.apply(lambda r: r["Estado_Planta"] == "Continúa" and neq(r.get("Cargo_ANT"), r.get("Cargo_ACT")), axis=1)
+    comp["Cambio_Area_Nomina"] = comp.apply(lambda r: r["Estado_Planta"] == "Continúa" and neq(r.get("Area_Nomina_ANT"), r.get("Area_Nomina_ACT")), axis=1)
+    comp["Diferencia_Salario"] = comp.get("Salario_Total_ACT", 0).fillna(0).astype(float) - comp.get("Salario_Total_ANT", 0).fillna(0).astype(float)
+    comp["Cambio_Salario"] = comp["Estado_Planta"].eq("Continúa") & comp["Diferencia_Salario"].abs().gt(1)
+
+    def movimiento(row):
+        if row["Estado_Planta"] != "Continúa":
+            return row["Estado_Planta"]
+        cambios = []
+        if row["Cambio_CECO"]:
+            cambios.append("Cambio CECO")
+        if row["Cambio_Tipo_CECO"]:
+            cambios.append("Cambio tipo CECO")
+        if row["Cambio_Salario"]:
+            cambios.append("Cambio salario")
+        if row["Cambio_Cargo"]:
+            cambios.append("Cambio cargo")
+        if row["Cambio_Area_Nomina"]:
+            cambios.append("Cambio área nómina")
+        return "; ".join(cambios) if cambios else "Sin cambio relevante"
+
+    comp["Movimiento"] = comp.apply(movimiento, axis=1)
+
+    columnas = [
+        "SAP", "Estado_Planta", "Movimiento",
+        "Nombre_ANT", "Nombre_ACT", "Numero_ID_ANT", "Numero_ID_ACT",
+        "CECO_ANT", "CECO_ACT", "Tipo_CECO_ANT", "Tipo_CECO_ACT",
+        "Centro_Coste_ANT", "Centro_Coste_ACT",
+        "Area_Nomina_ANT", "Area_Nomina_ACT", "Cargo_ANT", "Cargo_ACT",
+        "Nivel_ANT", "Nivel_ACT", "Regional_ANT", "Regional_ACT",
+        "Salario_Total_ANT", "Salario_Total_ACT", "Diferencia_Salario",
+        "Cambio_CECO", "Cambio_Tipo_CECO", "Cambio_Salario", "Cambio_Cargo", "Cambio_Area_Nomina",
+    ]
+    for c in columnas:
+        if c not in comp.columns:
+            comp[c] = ""
+    return comp[columnas].sort_values(["Estado_Planta", "SAP"]).reset_index(drop=True)
+
+
+def resumen_movimiento_planta(comparativo):
+    ant = comparativo.dropna(subset=["Tipo_CECO_ANT"]).copy()
+    act = comparativo.dropna(subset=["Tipo_CECO_ACT"]).copy()
+
+    hc_ant = ant[ant["Tipo_CECO_ANT"].astype(str).ne("")].groupby("Tipo_CECO_ANT")["SAP"].nunique().rename("HC_Mes_Anterior")
+    hc_act = act[act["Tipo_CECO_ACT"].astype(str).ne("")].groupby("Tipo_CECO_ACT")["SAP"].nunique().rename("HC_MD_Actual")
+    nuevos = comparativo[comparativo["Estado_Planta"].eq("Nuevo en MD actual")].groupby("Tipo_CECO_ACT")["SAP"].nunique().rename("Nuevos")
+    salidas = comparativo[comparativo["Estado_Planta"].eq("No está en MD actual")].groupby("Tipo_CECO_ANT")["SAP"].nunique().rename("Salidas")
+    cambio_ceco = comparativo[comparativo["Cambio_CECO"].eq(True)].groupby("Tipo_CECO_ACT")["SAP"].nunique().rename("Cambios_CECO_Entrada")
+
+    idx = sorted(set(hc_ant.index) | set(hc_act.index) | set(nuevos.index) | set(salidas.index) | set(cambio_ceco.index))
+    res = pd.DataFrame(index=idx)
+    res.index.name = "Tipo_CECO"
+    for s in [hc_ant, hc_act, nuevos, salidas, cambio_ceco]:
+        res = res.join(s, how="left")
+    res = res.fillna(0).astype(int).reset_index()
+    res["Variacion_HC"] = res["HC_MD_Actual"] - res["HC_Mes_Anterior"]
+    return res
+
+# ----------------------------
+# Homologación y salidas
+# ----------------------------
 
 def homologar_base_cuentas(base_conceptos, matriz_dkon):
     homologada = base_conceptos.merge(
@@ -299,17 +411,16 @@ def homologar_base_cuentas(base_conceptos, matriz_dkon):
 
     detalle_homologado = homologada[[
         "Periodo", "SAP", "Nombre", "Status", "Area_Nomina", "CECO", "Centro_Coste", "Tipo_CECO",
-        "Cargo", "Nivel", "Division_Personal", "Regional", "Concepto", "Descripcion_Concepto",
+        "Cargo", "Nivel", "Division_Personal", "Regional", "Numero_ID", "Concepto", "Descripcion_Concepto",
         "Cuenta_DKON", "Texto_Cuenta", "Grupo_DKON", "Descripcion_DKON",
         "Valor", "Fuente", "Llave_DKON"
     ]].copy()
 
-    # Base financiera por empleado + cuenta. Conserva lista de conceptos que suman a la cuenta.
     base_cuentas = (
         detalle_homologado
         .groupby([
             "Periodo", "SAP", "Nombre", "Status", "Area_Nomina", "CECO", "Centro_Coste", "Tipo_CECO",
-            "Cargo", "Nivel", "Division_Personal", "Regional", "Cuenta_DKON", "Texto_Cuenta",
+            "Cargo", "Nivel", "Division_Personal", "Regional", "Numero_ID", "Cuenta_DKON", "Texto_Cuenta",
             "Grupo_DKON", "Descripcion_DKON", "Fuente"
         ], dropna=False)
         .agg(
@@ -322,7 +433,7 @@ def homologar_base_cuentas(base_conceptos, matriz_dkon):
     return detalle_homologado, base_cuentas
 
 
-def construir_alertas(base_conceptos, detalle_homologado):
+def construir_alertas(base_conceptos, detalle_homologado, comparativo):
     alertas = []
 
     def add_alert(df, tipo, detalle):
@@ -355,17 +466,20 @@ def construir_alertas(base_conceptos, detalle_homologado):
         "Valor vacío",
         "El registro no trae valor numérico."
     )
-
-    dup = base_conceptos[base_conceptos.duplicated(subset=["SAP", "Concepto", "Fuente"], keep=False)].copy()
     add_alert(
-        dup[["SAP", "Nombre", "CECO", "Tipo_CECO", "Concepto", "Valor", "Fuente"]],
-        "Duplicado SAP + concepto + fuente",
-        "Puede ser válido si hay varios registros vigentes, pero debe revisarse."
+        comparativo[comparativo["Estado_Planta"].eq("No está en MD actual")][["SAP", "Nombre_ANT", "CECO_ANT", "Tipo_CECO_ANT", "Salario_Total_ANT"]],
+        "Empleado del MD anterior no está en MD actual",
+        "Puede representar retiro real, depuración de base o cambio no identificado."
+    )
+    add_alert(
+        comparativo[comparativo["Estado_Planta"].eq("Nuevo en MD actual")][["SAP", "Nombre_ACT", "CECO_ACT", "Tipo_CECO_ACT", "Salario_Total_ACT"]],
+        "Empleado nuevo en MD actual",
+        "Puede representar ingreso real o empleado que no venía en la foto anterior."
     )
 
     if alertas:
         return pd.concat(alertas, ignore_index=True)
-    return pd.DataFrame(columns=["Tipo_Alerta", "Detalle_Alerta", "SAP", "Nombre", "CECO", "Tipo_CECO", "Concepto", "Valor", "Fuente"])
+    return pd.DataFrame(columns=["Tipo_Alerta", "Detalle_Alerta"])
 
 
 def resumenes(base_cuentas):
@@ -418,14 +532,16 @@ def to_excel_bytes(sheets: dict):
                     sample = df[value].astype(str).head(100).map(len).max()
                     width = min(max(width, int(sample) + 2), 45)
                 ws.set_column(col_num, col_num, width, text_fmt)
-                if value.lower() in ["valor", "hc"] or "valor" in value.lower():
+                if value.lower() in ["valor", "hc"] or "valor" in value.lower() or "salario" in value.lower() or "diferencia" in value.lower():
                     ws.set_column(col_num, col_num, 16, money_fmt)
-            if "ALERTAS" in safe_name.upper():
+            if "ALERTA" in safe_name.upper():
                 ws.set_tab_color("#DC2626")
                 ws.conditional_format(1, 0, max(len(df), 1), max(len(df.columns) - 1, 0), {
                     "type": "no_errors",
                     "format": warn_fmt,
                 })
+            elif "COMPARATIVO" in safe_name.upper() or "MOVIMIENTO" in safe_name.upper():
+                ws.set_tab_color("#2563EB")
             else:
                 ws.set_tab_color("#F97316")
     output.seek(0)
@@ -435,68 +551,80 @@ def to_excel_bytes(sheets: dict):
 # Interfaz
 # ----------------------------
 
-st.title("🦜 Proyección de Costos JMC - MVP 1")
-st.caption("Motor inicial: conceptos Y + tipo de CECO + cuenta DKON")
+st.title("🦜 Proyección de Costos JMC - MVP 2")
+st.caption("Motor inicial: DKON + MD anterior + MD actual + conceptos Y")
 
-with st.expander("📌 ¿Qué hace esta primera versión?", expanded=True):
+with st.expander("📌 ¿Qué hace esta versión?", expanded=True):
     st.markdown(
         """
-        Esta versión construye la base mínima del modelo financiero:
+        Esta versión construye la base mínima del modelo financiero y agrega el comparativo de planta:
 
         1. Lee **Dkon** y crea la matriz `Concepto Y + Tipo CECO = Cuenta DKON`.
-        2. Lee el **MD Actual** y clasifica el CECO del empleado:
+        2. Lee **MD Mes Anterior** y **MD Actual**.
+        3. Clasifica CECO por prefijo:
            - `101` = Tiendas
            - `102` = Logística / CEDIS
            - `103` = Admon
-        3. Genera el detalle por concepto `Y`.
-        4. Homologa cada concepto a cuenta DKON.
-        5. Entrega una base lista para Power Query / Power Pivot.
+        4. Genera el detalle por concepto `Y` del MD actual.
+        5. Homologa cada concepto a cuenta DKON.
+        6. Genera comparativo de planta: nuevos, salidas, cambios de salario, CECO, cargo y área nómina.
         """
     )
 
+periodo = st.text_input("Periodo de proyección", value=datetime.today().strftime("%Y-%m"))
+
 col1, col2, col3 = st.columns([1, 1, 1])
 with col1:
-    periodo = st.text_input("Periodo de proyección", value=datetime.today().strftime("%Y-%m"))
-with col2:
     dkon_file = st.file_uploader("1. Cargar Dkon.XLSX", type=["xlsx", "xlsm", "xls"])
+with col2:
+    md_ant_file = st.file_uploader("2. Cargar MD Mes Anterior", type=["xlsx", "xlsm", "xls"])
 with col3:
-    md_file = st.file_uploader("2. Cargar MD_ACTUAL.xlsx", type=["xlsx", "xlsm", "xls"])
+    md_act_file = st.file_uploader("3. Cargar MD Actual", type=["xlsx", "xlsm", "xls"])
 
-procesar = st.button("🚀 Generar base MVP")
+procesar = st.button("🚀 Generar base MVP 2")
 
 if procesar:
-    if dkon_file is None or md_file is None:
-        st.error("Debes cargar mínimo Dkon y MD Actual.")
+    if dkon_file is None or md_ant_file is None or md_act_file is None:
+        st.error("Debes cargar Dkon, MD Mes Anterior y MD Actual.")
         st.stop()
 
     try:
         with st.spinner("Leyendo Dkon y construyendo matriz de homologación..."):
             matriz_dkon = construir_matriz_dkon(dkon_file)
 
+        with st.spinner("Leyendo MD Mes Anterior y MD Actual para comparativo de planta..."):
+            md_ant_dim = leer_md_dimension(md_ant_file, etiqueta="Mes anterior")
+            md_act_dim = leer_md_dimension(md_act_file, etiqueta="Actual")
+            comparativo = construir_comparativo_md(md_ant_dim, md_act_dim)
+            res_mov = resumen_movimiento_planta(comparativo)
+
         with st.spinner("Leyendo MD Actual y normalizando conceptos Y..."):
-            md_norm = leer_md_normalizado(md_file)
-            base_conceptos = crear_base_conceptos(md_norm, periodo, fuente="MD Actual")
+            md_conceptos = leer_md_conceptos(md_act_file, fuente="MD Actual")
+            base_conceptos = crear_base_conceptos(md_conceptos, periodo)
 
         with st.spinner("Homologando conceptos contra cuenta DKON..."):
             detalle_homologado, base_cuentas = homologar_base_cuentas(base_conceptos, matriz_dkon)
-            alertas = construir_alertas(base_conceptos, detalle_homologado)
             resumen_tipo, resumen_cuenta, resumen_ceco = resumenes(base_cuentas)
+            alertas = construir_alertas(base_conceptos, detalle_homologado, comparativo)
 
         total_valor = base_cuentas["Valor"].sum() if not base_cuentas.empty else 0
         total_hc = base_cuentas["SAP"].nunique() if not base_cuentas.empty else 0
         sin_cuenta = detalle_homologado["Cuenta_DKON"].isna().sum() + detalle_homologado["Cuenta_DKON"].eq("").sum()
+        nuevos = int((comparativo["Estado_Planta"] == "Nuevo en MD actual").sum())
+        salidas = int((comparativo["Estado_Planta"] == "No está en MD actual").sum())
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Conceptos Y en Dkon", f"{matriz_dkon['Concepto'].nunique():,}")
         m2.metric("Registros detalle", f"{len(detalle_homologado):,}")
-        m3.metric("HC", f"{total_hc:,}")
-        m4.metric("Sin cuenta DKON", f"{int(sin_cuenta):,}")
+        m3.metric("HC MD Actual", f"{total_hc:,}")
+        m4.metric("Nuevos", f"{nuevos:,}")
+        m5.metric("Salidas", f"{salidas:,}")
 
-        st.subheader("Vista previa - Base por cuenta")
+        st.subheader("Vista previa - Base por cuenta DKON")
         st.dataframe(base_cuentas.head(100), use_container_width=True)
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "Resumen Tipo", "Resumen Cuenta", "Resumen CECO", "Detalle Conceptos", "Alertas"
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+            "Resumen Tipo", "Resumen Cuenta", "Resumen CECO", "Mov. Planta", "Comparativo MD", "Detalle Conceptos", "Alertas"
         ])
         with tab1:
             st.dataframe(resumen_tipo, use_container_width=True)
@@ -505,13 +633,20 @@ if procesar:
         with tab3:
             st.dataframe(resumen_ceco, use_container_width=True)
         with tab4:
-            st.dataframe(detalle_homologado.head(500), use_container_width=True)
+            st.dataframe(res_mov, use_container_width=True)
         with tab5:
-            st.dataframe(alertas.head(500), use_container_width=True)
+            st.dataframe(comparativo.head(1000), use_container_width=True)
+        with tab6:
+            st.dataframe(detalle_homologado.head(1000), use_container_width=True)
+        with tab7:
+            st.dataframe(alertas.head(1000), use_container_width=True)
 
         sheets = {
             "MATRIZ_DKON_Y": matriz_dkon,
-            "MD_NORMALIZADO_Y": md_norm,
+            "MD_ANT_NORMALIZADO": md_ant_dim,
+            "MD_ACT_NORMALIZADO": md_act_dim,
+            "COMPARATIVO_MD": comparativo,
+            "RESUMEN_MOV_PLANTA": res_mov,
             "BASE_CONCEPTOS_Y": detalle_homologado,
             "BASE_CUENTAS_DKON": base_cuentas,
             "RESUMEN_TIPO_CECO": resumen_tipo,
@@ -521,13 +656,13 @@ if procesar:
         }
         excel_bytes = to_excel_bytes(sheets)
         st.download_button(
-            "⬇️ Descargar base de proyección MVP",
+            "⬇️ Descargar base de proyección MVP 2",
             data=excel_bytes,
-            file_name=f"Base_Proyeccion_Costos_MVP_{periodo}.xlsx",
+            file_name=f"Base_Proyeccion_Costos_MVP2_{periodo}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        st.success("Base generada correctamente. Valida primero BASE_CONCEPTOS_Y y BASE_CUENTAS_DKON.")
+        st.success("Base generada correctamente. Valida COMPARATIVO_MD, BASE_CONCEPTOS_Y y BASE_CUENTAS_DKON.")
 
     except Exception as e:
         st.exception(e)
