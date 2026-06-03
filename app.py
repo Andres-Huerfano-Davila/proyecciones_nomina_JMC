@@ -10,7 +10,7 @@ import streamlit as st
 # ============================================================
 # CONFIGURACIÓN GENERAL
 # ============================================================
-APP_TITLE = "Modelo financiero nómina JMC"
+APP_TITLE = "Modelo proyecciones nómina JMC V5"
 DEFAULT_SMMLV = 1_750_905
 DEFAULT_AUX_TRANSPORTE = 249_095
 
