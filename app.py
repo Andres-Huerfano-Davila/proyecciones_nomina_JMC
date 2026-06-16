@@ -192,25 +192,97 @@ def count_days_for_hours(year, month, day_type) -> int:
 # ============================================================
 # Lectores principales
 # ============================================================
+def _find_optional_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    return find_col(df, candidates, required=False)
+
+def _bool_from_col(df: pd.DataFrame, col: Optional[str], default=False) -> pd.Series:
+    if col and col in df.columns:
+        return df[col].map(lambda x: yes_no(x, default))
+    return pd.Series([default] * len(df), index=df.index)
+
 def build_dkon_matrix(file) -> pd.DataFrame:
-    sheets = safe_sheet_names(file); sheet = "Sheet1" if "Sheet1" in sheets else sheets[0]
+    """Construye matriz DKON enriquecida.
+
+    Llave central:
+        Concepto Y + Tipo_CECO = Cuenta DKON + marcas laborales/financieras.
+
+    El DKON puede venir con columnas nuevas:
+      - Salarial / Seguridad Social
+      - LEY 1393
+      - Base parafiscales
+      - Base Vacaciones
+      - Base prestaciones sociales
+
+    Si alguna columna no existe, la app deja una marca de origen y usa defaults conservadores
+    para que el MVP siga funcionando, pero queda alerta para completar DKON.
+    """
+    sheets = safe_sheet_names(file)
+    sheet = "Sheet1" if "Sheet1" in sheets else sheets[0]
     df = read_sheet(file, sheet)
+
     c_con = find_col(df, ["CC-nómina", "CC nomina", "CC-nomina"], True)
     c_txt = find_col(df, ["Txt.CC-nóm.", "Texto CC nomina", "Texto concepto"])
     c_acc = find_col(df, ["Cta.mayor", "Cta mayor", "Cuenta mayor"], True)
     c_acc_txt = find_col(df, ["Texto breve", "Texto cuenta"])
     c_group = find_col(df, ["CUENTA", "Grupo", "Grupo de cuentas"])
     c_desc = find_col(df, ["Descripcion ", "Descripción", "Descripcion"])
-    out = pd.DataFrame()
+
+    c_ss = _find_optional_col(df, ["Salarial / Seguridad Social", "Salarial Seguridad Social", "Seguridad Social", "Base IBC", "Base SS", "IBC", "Salarial"])
+    c_ley1393 = _find_optional_col(df, ["LEY 1393", "Ley 1393", "1393"])
+    c_paraf = _find_optional_col(df, ["Base parafiscales", "Base Parafiscales", "Parafiscales"])
+    c_vac = _find_optional_col(df, ["Base Vacaciones", "Vacaciones"])
+    c_prest = _find_optional_col(df, ["Base prestaciones sociales", "Base Prestaciones Sociales", "Prestaciones sociales", "Base prestaciones", "Prestaciones"])
+    c_regla = _find_optional_col(df, ["Regla cálculo", "Regla_Calculo", "Regla Calculo", "Regla"])
+
+    out = pd.DataFrame(index=df.index)
     out["Concepto"] = df[c_con].map(to_concept)
     out["Cuenta_DKON"] = df[c_acc].map(to_ceco)
-    out = out[out["Concepto"].str.startswith("Y", na=False) & out["Cuenta_DKON"].str[:2].isin(["60","62","63"])].copy()
+    out = out[out["Concepto"].str.startswith("Y", na=False) & out["Cuenta_DKON"].str[:2].isin(["60", "62", "63"])].copy()
     out["Tipo_CECO"] = out["Cuenta_DKON"].str[:2].map(TIPO_CECO_BY_ACCOUNT_PREFIX)
-    out["Texto_Concepto_DKON"] = df.loc[out.index, c_txt].fillna("") if c_txt else ""
-    out["Texto_Cuenta"] = df.loc[out.index, c_acc_txt].fillna("") if c_acc_txt else ""
-    out["Grupo_DKON"] = df.loc[out.index, c_group].fillna("") if c_group else ""
-    out["Descripcion_DKON"] = df.loc[out.index, c_desc].fillna("") if c_desc else ""
-    return out.drop_duplicates().sort_values(["Concepto","Tipo_CECO","Cuenta_DKON"]).drop_duplicates(["Concepto","Tipo_CECO"], keep="first").reset_index(drop=True)
+
+    out["Texto_Concepto_DKON"] = df.loc[out.index, c_txt].fillna("").astype(str).str.strip() if c_txt else ""
+    out["Texto_Cuenta"] = df.loc[out.index, c_acc_txt].fillna("").astype(str).str.strip() if c_acc_txt else ""
+    out["Grupo_DKON"] = df.loc[out.index, c_group].fillna("").astype(str).str.strip() if c_group else ""
+    out["Descripcion_DKON"] = df.loc[out.index, c_desc].fillna("").astype(str).str.strip() if c_desc else ""
+
+    # Defaults fallback si el DKON todavía no tiene las columnas enriquecidas.
+    # Cuando el DKON trae columnas, se obedece el archivo.
+    def default_base(concepto, flag):
+        if concepto in BASIC_SALARY_CONCEPTS:
+            return True
+        if concepto == AUX_TRANSPORTE_CONCEPT:
+            return flag in ["paraf", "prest", "exo"]  # aux no IBC ni vacaciones por defecto
+        if concepto in HOUR_CONCEPTS:
+            return flag in ["ibc", "paraf", "prest", "exo"]
+        return flag == "exo"
+
+    if c_ss:
+        out["Salarial_Seguridad_Social"] = df.loc[out.index, c_ss].map(lambda x: yes_no(x, False))
+        out["Base_IBC"] = out["Salarial_Seguridad_Social"]
+    else:
+        out["Base_IBC"] = out["Concepto"].map(lambda c: default_base(c, "ibc"))
+        out["Salarial_Seguridad_Social"] = out["Base_IBC"]
+
+    out["LEY_1393"] = df.loc[out.index, c_ley1393].fillna("").astype(str).str.strip() if c_ley1393 else ""
+    out["Base_Parafiscales"] = df.loc[out.index, c_paraf].map(lambda x: yes_no(x, False)) if c_paraf else out["Concepto"].map(lambda c: default_base(c, "paraf"))
+    out["Base_Vacaciones"] = df.loc[out.index, c_vac].map(lambda x: yes_no(x, False)) if c_vac else out["Concepto"].map(lambda c: default_base(c, "vac"))
+    out["Base_Prestaciones"] = df.loc[out.index, c_prest].map(lambda x: yes_no(x, False)) if c_prest else out["Concepto"].map(lambda c: default_base(c, "prest"))
+    out["Base_Exoneracion"] = out["Concepto"].map(lambda c: default_base(c, "exo"))
+
+    if c_regla:
+        out["Regla_Calculo"] = df.loc[out.index, c_regla].fillna("NETO").astype(str).str.upper().str.strip()
+    else:
+        out["Regla_Calculo"] = out["Concepto"].map(lambda c: "PROPORCIONAL_DIAS" if c in BASIC_SALARY_CONCEPTS or c == AUX_TRANSPORTE_CONCEPT else "NETO")
+
+    out["Origen_Marcacion_DKON"] = "DKON enriquecido" if any([c_ss, c_paraf, c_vac, c_prest]) else "Default MVP - completar DKON"
+
+    cols = [
+        "Concepto", "Texto_Concepto_DKON", "Tipo_CECO", "Cuenta_DKON", "Texto_Cuenta", "Grupo_DKON", "Descripcion_DKON",
+        "Salarial_Seguridad_Social", "LEY_1393", "Base_IBC", "Base_Parafiscales", "Base_Vacaciones", "Base_Prestaciones",
+        "Base_Exoneracion", "Regla_Calculo", "Origen_Marcacion_DKON",
+    ]
+    out = out[cols].drop_duplicates().sort_values(["Concepto", "Tipo_CECO", "Cuenta_DKON"])
+    return out.drop_duplicates(["Concepto", "Tipo_CECO"], keep="first").reset_index(drop=True)
 
 def read_md_dimension(file) -> pd.DataFrame:
     sheets = safe_sheet_names(file); sheet = "Consolidado__Base" if "Consolidado__Base" in sheets else sheets[0]
@@ -340,13 +412,55 @@ def read_real_retires(file):
     out = pd.DataFrame({"SAP": df[c_sap].map(to_sap), "Fecha_Retiro_Real": to_datetime_series(df[c_fecha])})
     return out[(out["SAP"] != "") & out["Fecha_Retiro_Real"].notna()].drop_duplicates("SAP", keep="last")
 
-def read_projected_retires(file):
-    if file is None: return pd.DataFrame()
-    df = read_sheet(file); c_cargo = find_col(df, ["Cargo", "Función", "Funcion"], True); c_qty = find_col(df, ["Cantidad", "Cant", "Retiros"], True); c_fecha = find_col(df, ["Fecha retiro", "Fecha de retiro", "Fecha proyectada", "Fecha"], True)
-    c_tipo = find_col(df, ["Tipo CECO", "Tipo_CECO", "Negocio", "Ceco"]); c_area = find_col(df, ["Área de nómina", "Area de nomina"])
-    out = pd.DataFrame({"Cargo": df[c_cargo].fillna("").astype(str).str.strip(), "Cantidad_Retiros": df[c_qty].map(to_number).astype(int), "Fecha_Retiro_Proyectada": to_datetime_series(df[c_fecha])})
-    out["Cargo_Key"] = out["Cargo"].map(norm_key); out["Tipo_CECO"] = df[c_tipo].fillna("").astype(str).str.strip() if c_tipo else ""; out["Area_Nomina"] = df[c_area].fillna("").astype(str).str.strip() if c_area else ""
-    return out[(out["Cargo_Key"] != "") & (out["Cantidad_Retiros"] > 0) & out["Fecha_Retiro_Proyectada"].notna()].reset_index(drop=True)
+def read_projected_retires(file, default_fecha=None):
+    """Lee la solicitud de retiros proyectados por cargo.
+
+    Estructura ideal:
+      Cargo | Cantidad | Fecha retiro proyectada | Tipo CECO | Área de nómina
+
+    Pero el archivo que hoy usan en el query puede traer solo Cargo + Cantidad.
+    En ese caso no se rompe la app: usa default_fecha, normalmente la fecha fin del periodo.
+    """
+    if file is None:
+        return pd.DataFrame()
+
+    sheets = safe_sheet_names(file)
+    # Si existe TablaResumen, suele ser la tabla limpia del archivo de retiros por cargo.
+    sheet = "TablaResumen" if "TablaResumen" in sheets else ("Hoja2" if "Hoja2" in sheets else sheets[0])
+
+    # Intento normal. Si la primera fila no es encabezado útil, detectamos.
+    df = read_sheet(file, sheet)
+    if not find_col(df, ["Cargo", "Función", "Funcion"], False) or not find_col(df, ["Cantidad", "Cant", "Retiros", "Cuenta de cargo"], False):
+        header = detect_header_row(file, sheet, ["cargo", "cantidad", "retiros"], max_rows=12)
+        df = read_sheet(file, sheet, header)
+
+    c_cargo = find_col(df, ["Cargo", "Función", "Funcion", "cargo_normalizado"], True)
+    c_qty = find_col(df, ["Cantidad retiros", "Cantidad_Retiros", "Cantidad", "Cant", "Retiros", "Cuenta de cargo", "Cuenta"], True)
+    c_fecha = find_col(df, [
+        "Fecha retiro proyectada", "Fecha_Retiro_Proyectada", "Fecha retiro", "Fecha de retiro",
+        "Fecha proyectada", "Fecha baja", "Baja", "Fec retiro", "Fecha"
+    ], False)
+    c_tipo = find_col(df, ["Tipo CECO", "Tipo_CECO", "Negocio", "Ceco", "Tipo", "Área"], False)
+    c_area = find_col(df, ["Área de nómina", "Area de nomina", "Area_Nomina"], False)
+
+    out = pd.DataFrame()
+    out["Cargo"] = df[c_cargo].fillna("").astype(str).str.strip()
+    out["Cantidad_Retiros"] = df[c_qty].map(to_number).fillna(0).astype(int)
+
+    if c_fecha:
+        out["Fecha_Retiro_Proyectada"] = to_datetime_series(df[c_fecha])
+        out["Fecha_Retiro_Origen"] = "Archivo"
+    else:
+        fecha_default = pd.Timestamp(default_fecha).normalize() if default_fecha is not None else pd.NaT
+        out["Fecha_Retiro_Proyectada"] = fecha_default
+        out["Fecha_Retiro_Origen"] = "Default fin periodo" if pd.notna(fecha_default) else "Pendiente fecha"
+
+    out["Cargo_Key"] = out["Cargo"].map(norm_key)
+    out["Tipo_CECO"] = df[c_tipo].fillna("").astype(str).str.strip() if c_tipo else ""
+    out["Area_Nomina"] = df[c_area].fillna("").astype(str).str.strip() if c_area else ""
+
+    out = out[(out["Cargo_Key"] != "") & (out["Cantidad_Retiros"] > 0)].copy()
+    return out.reset_index(drop=True)
 
 def read_recruitment_raw(file):
     if file is None: return pd.DataFrame()
@@ -575,10 +689,176 @@ def build_excel(dfs: Dict[str, pd.DataFrame]) -> bytes:
                 width=min(max([len(str(c))]+[len(str(v)) for v in export[c].head(100).fillna("").tolist()])+2,45); ws.set_column(i,i,width,fmt)
     output.seek(0); return output.getvalue()
 
+
 # ============================================================
-# UI
+# Salidas V5.2 desde DKON enriquecido
 # ============================================================
-st.set_page_config(page_title=APP_TITLE, page_icon="💼", layout="wide")
+def attach_dkon_attributes(base: pd.DataFrame, dkon: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if base.empty:
+        return base, pd.DataFrame()
+    attrs = [
+        "Concepto", "Tipo_CECO", "Cuenta_DKON", "Texto_Cuenta", "Grupo_DKON", "Descripcion_DKON",
+        "Texto_Concepto_DKON", "Salarial_Seguridad_Social", "LEY_1393", "Base_IBC", "Base_Parafiscales",
+        "Base_Vacaciones", "Base_Prestaciones", "Base_Exoneracion", "Regla_Calculo", "Origen_Marcacion_DKON",
+    ]
+    out = base.merge(dkon[attrs], on=["Concepto", "Tipo_CECO"], how="left")
+    for c in ["Salarial_Seguridad_Social", "Base_IBC", "Base_Parafiscales", "Base_Vacaciones", "Base_Prestaciones", "Base_Exoneracion"]:
+        out[c] = out[c].fillna(False).astype(bool)
+    out["Regla_Calculo"] = out["Regla_Calculo"].fillna("SIN_DKON")
+    out["Origen_Marcacion_DKON"] = out["Origen_Marcacion_DKON"].fillna("Sin DKON")
+    missing = out[out["Cuenta_DKON"].isna() | (out["Cuenta_DKON"].astype(str).str.strip() == "")].copy()
+    return out, missing
+
+def homologate(base: pd.DataFrame, dkon: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if base.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if "Cuenta_DKON" not in base.columns:
+        base, missing = attach_dkon_attributes(base, dkon)
+    else:
+        missing = base[base["Cuenta_DKON"].isna() | (base["Cuenta_DKON"].astype(str).str.strip() == "")].copy()
+    ok = base.drop(missing.index, errors="ignore").copy()
+    if ok.empty:
+        return ok, missing
+    gcols = [
+        "Periodo", "SAP", "Nombre", "Area_Nomina", "CECO", "Tipo_CECO", "Centro_Coste", "Cargo", "Nivel",
+        "Cuenta_DKON", "Texto_Cuenta", "Grupo_DKON", "Descripcion_DKON", "Fuente",
+        "Salarial_Seguridad_Social", "LEY_1393", "Base_IBC", "Base_Parafiscales", "Base_Vacaciones", "Base_Prestaciones", "Base_Exoneracion",
+    ]
+    for c in gcols:
+        if c not in ok.columns:
+            ok[c] = "" if c not in ["Base_IBC", "Base_Parafiscales", "Base_Vacaciones", "Base_Prestaciones", "Base_Exoneracion", "Salarial_Seguridad_Social"] else False
+    agg = ok.groupby(gcols, dropna=False).agg(
+        Valor=("Valor", "sum"),
+        Conceptos_Agrupados=("Concepto", lambda s: ", ".join(sorted(set(s.astype(str))))),
+        Dias_Pagados_Prom=("Dias_Pagados", "mean"),
+    ).reset_index()
+    agg["Valor"] = agg["Valor"].round(0)
+    return agg, missing
+
+def build_ibc(base: pd.DataFrame, smmlv: float) -> pd.DataFrame:
+    if base.empty or "Base_IBC" not in base.columns:
+        return pd.DataFrame()
+    ibc_src = base[base["Base_IBC"].fillna(False)].copy()
+    if ibc_src.empty:
+        return pd.DataFrame()
+    ibc = ibc_src.groupby(["Periodo", "SAP", "Nombre", "CECO", "Tipo_CECO", "Cargo", "Area_Nomina"], as_index=False).agg(
+        IBC_Preliminar=("Valor", "sum"),
+        Conceptos_IBC=("Concepto", lambda s: ", ".join(sorted(set(s.astype(str))))),
+    )
+    exo = base[base["Base_Exoneracion"].fillna(False)].groupby("SAP")["Valor"].sum() if "Base_Exoneracion" in base.columns else pd.Series(dtype=float)
+    ibc["Devengo_Para_Exoneracion"] = ibc["SAP"].map(exo).fillna(0)
+    ibc["Menor_10_SMMLV"] = ibc["Devengo_Para_Exoneracion"] < 10 * smmlv
+    ibc["Nota"] = "Base IBC preliminar según marca DKON. Falta módulo de aportes y exclusiones aprendices/practicantes."
+    return ibc
+
+def build_base_flag(base: pd.DataFrame, flag_col: str, value_col: str, concept_col: str) -> pd.DataFrame:
+    if base.empty or flag_col not in base.columns:
+        return pd.DataFrame()
+    src = base[base[flag_col].fillna(False)].copy()
+    if src.empty:
+        return pd.DataFrame()
+    out = src.groupby(["Periodo", "SAP", "Nombre", "CECO", "Tipo_CECO", "Cargo", "Area_Nomina"], as_index=False).agg(
+        **{value_col: ("Valor", "sum"), concept_col: ("Concepto", lambda s: ", ".join(sorted(set(s.astype(str)))))}
+    )
+    out[value_col] = out[value_col].round(0)
+    return out
+
+def read_previous_provisions(file) -> pd.DataFrame:
+    if file is None:
+        return pd.DataFrame()
+    df = read_sheet(file)
+    c_sap = find_col(df, ["SAP", "Nº pers.", "N° pers.", "Número de personal"], True)
+    # Formato largo: SAP | Tipo_Provision | Valor
+    c_tipo = find_col(df, ["Tipo Provision", "Tipo_Provision", "Concepto_Provision", "Provision", "Provisión"], False)
+    c_val = find_col(df, ["Valor", "Valor provision", "Valor_Provision", "Importe", "Saldo"], False)
+    if c_tipo and c_val:
+        out = pd.DataFrame({"SAP": df[c_sap].map(to_sap), "Tipo_Provision": df[c_tipo].fillna("").astype(str).str.strip(), "Valor_Provision_Mes_Anterior": df[c_val].map(to_number)})
+        return out[(out["SAP"] != "") & (out["Tipo_Provision"] != "")]
+    # Formato ancho: SAP | Prima_Ant | Cesantias_Ant | etc.
+    candidates = {
+        "Prima": ["Prima_Ant", "Prima Ant", "Prima", "Provision Prima", "Provisión Prima"],
+        "Cesantias": ["Cesantias_Ant", "Cesantías_Ant", "Cesantias Ant", "Cesantías Ant", "Cesantias", "Cesantías"],
+        "Intereses": ["Intereses_Ant", "Intereses Ant", "Intereses", "Intereses Cesantias", "Intereses Cesantías"],
+        "Vacaciones": ["Vacaciones_Ant", "Vacaciones Ant", "Vacaciones", "Provision Vacaciones", "Provisión Vacaciones"],
+    }
+    rows = []
+    for tipo, cands in candidates.items():
+        col = find_col(df, cands, False)
+        if col:
+            tmp = pd.DataFrame({"SAP": df[c_sap].map(to_sap), "Tipo_Provision": tipo, "Valor_Provision_Mes_Anterior": df[col].map(to_number)})
+            rows.append(tmp)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.concat(rows, ignore_index=True)
+    return out[(out["SAP"] != "") & (out["Valor_Provision_Mes_Anterior"] != 0)]
+
+def build_summary_hc(md: pd.DataFrame, recl: pd.DataFrame, ret_real: pd.DataFrame, ret_sel: pd.DataFrame) -> pd.DataFrame:
+    tipos = ["Tiendas", "Logística", "Admon", "Sin clasificar"]
+    base = pd.DataFrame({"Tipo_CECO": tipos})
+    hc = md.groupby("Tipo_CECO", as_index=False).agg(HC_MD_Actual=("SAP", "nunique")) if not md.empty else pd.DataFrame(columns=["Tipo_CECO", "HC_MD_Actual"])
+    ing = recl.groupby("Tipo_CECO", as_index=False).agg(Ingresos=("SAP", "nunique")) if recl is not None and not recl.empty else pd.DataFrame(columns=["Tipo_CECO", "Ingresos"])
+    if ret_real is not None and not ret_real.empty:
+        rr = ret_real.merge(md[["SAP", "Tipo_CECO"]], on="SAP", how="left").groupby("Tipo_CECO", as_index=False).agg(Retiros_Reales=("SAP", "nunique"))
+    else:
+        rr = pd.DataFrame(columns=["Tipo_CECO", "Retiros_Reales"])
+    rp = ret_sel.groupby("Tipo_CECO", as_index=False).agg(Retiros_Proyectados=("SAP", "nunique")) if ret_sel is not None and not ret_sel.empty else pd.DataFrame(columns=["Tipo_CECO", "Retiros_Proyectados"])
+    out = base.merge(hc, how="left").merge(ing, how="left").merge(rr, how="left").merge(rp, how="left").fillna(0)
+    for c in ["HC_MD_Actual", "Ingresos", "Retiros_Reales", "Retiros_Proyectados"]:
+        out[c] = out[c].astype(int)
+    out["HC_Proyectado"] = out["HC_MD_Actual"] + out["Ingresos"] - out["Retiros_Reales"] - out["Retiros_Proyectados"]
+    return out
+
+def build_summary_absences(abs_df: pd.DataFrame, md: pd.DataFrame) -> pd.DataFrame:
+    if abs_df is None or abs_df.empty:
+        return pd.DataFrame(columns=["Tipo_CECO", "Personas_Ausentismo", "Dias_Ausentismo"])
+    tmp = abs_df.merge(md[["SAP", "Tipo_CECO", "CECO"]], on="SAP", how="left")
+    tmp["Tipo_CECO"] = tmp["Tipo_CECO"].fillna("Sin clasificar")
+    return tmp.groupby("Tipo_CECO", as_index=False).agg(Personas_Ausentismo=("SAP", "nunique"), Dias_Ausentismo=("Dias_Ausentismo", "sum"))
+
+def build_summary_ingresos(recl: pd.DataFrame) -> pd.DataFrame:
+    if recl is None or recl.empty:
+        return pd.DataFrame(columns=["Tipo_CECO", "Ingresos", "CECOs_Impactados"])
+    return recl.groupby("Tipo_CECO", as_index=False).agg(Ingresos=("SAP", "nunique"), CECOs_Impactados=("CECO", "nunique"))
+
+def build_summary_retiros(ret_real: pd.DataFrame, ret_sel: pd.DataFrame, md: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    if ret_real is not None and not ret_real.empty:
+        rr = ret_real.merge(md[["SAP", "Tipo_CECO"]], on="SAP", how="left").assign(Tipo_Retiro="Real")
+        rows.append(rr[["SAP", "Tipo_CECO", "Tipo_Retiro"]])
+    if ret_sel is not None and not ret_sel.empty:
+        rows.append(ret_sel[["SAP", "Tipo_CECO"]].assign(Tipo_Retiro="Proyectado"))
+    if not rows:
+        return pd.DataFrame(columns=["Tipo_CECO", "Retiros_Reales", "Retiros_Proyectados", "Total_Retiros"])
+    tmp = pd.concat(rows, ignore_index=True)
+    piv = tmp.pivot_table(index="Tipo_CECO", columns="Tipo_Retiro", values="SAP", aggfunc="nunique", fill_value=0).reset_index()
+    if "Real" not in piv.columns: piv["Real"] = 0
+    if "Proyectado" not in piv.columns: piv["Proyectado"] = 0
+    piv = piv.rename(columns={"Real": "Retiros_Reales", "Proyectado": "Retiros_Proyectados"})
+    piv["Total_Retiros"] = piv["Retiros_Reales"] + piv["Retiros_Proyectados"]
+    return piv
+
+def build_alerts(md, base, missing, extras):
+    rows = []
+    for _, r in md[md["Tipo_CECO"] == "Sin clasificar"].iterrows():
+        rows.append({"Tipo": "CECO sin clasificar", "SAP": r["SAP"], "Detalle": r["CECO"], "Valor": None})
+    if not base.empty:
+        if "Regla_Calculo" in base.columns:
+            for _, r in base[base["Regla_Calculo"].isin(["SIN_DKON", "SIN_REGLA"])].iterrows():
+                rows.append({"Tipo": "Concepto sin marcación DKON", "SAP": r.get("SAP"), "Detalle": r.get("Concepto"), "Valor": r.get("Valor")})
+        if "Origen_Marcacion_DKON" in base.columns:
+            fallback = base[base["Origen_Marcacion_DKON"].astype(str).str.contains("Default MVP", na=False)]
+            for concepto in sorted(fallback["Concepto"].dropna().unique()):
+                rows.append({"Tipo": "DKON sin columnas de bases", "SAP": "", "Detalle": f"{concepto}: usando default MVP", "Valor": None})
+    if missing is not None and not missing.empty:
+        for _, r in missing.iterrows():
+            rows.append({"Tipo": "Concepto sin cuenta DKON", "SAP": r.get("SAP"), "Detalle": f"{r.get('Concepto')} / {r.get('Tipo_CECO')}", "Valor": r.get("Valor")})
+    frames = [pd.DataFrame(rows)] + [e for e in extras if e is not None and not e.empty]
+    return pd.concat(frames, ignore_index=True) if any(not f.empty for f in frames) else pd.DataFrame(columns=["Tipo", "SAP", "Detalle", "Valor"])
+
+# ============================================================
+# UI V5.2
+# ============================================================
+st.set_page_config(page_title="Modelo proyecciones nómina JMC V5.2", page_icon="💼", layout="wide")
 st.markdown("""
 <style>
 .main {background: linear-gradient(180deg, #fff7ed 0%, #ffffff 30%);} .block-container {padding-top: 1.2rem;}
@@ -587,100 +867,190 @@ div[data-testid="stMetric"] {background:#fff7ed; border:1px solid #fed7aa; paddi
 .footer {font-size:.82rem; color:#78716c; margin-top:2rem;}
 </style>""", unsafe_allow_html=True)
 st.markdown('<div class="big-title">💼 Modelo proyecciones de nómina JMC</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">V5 · Base detalle por concepto, novedades, retiros, IT14/IT15, horas pagas y proyección de horas del mes siguiente.</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">V5.2 · DKON enriquecido, base detalle, IBC/parafiscales/prestaciones/vacaciones como insumo y resúmenes de planta.</div>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("⚙️ Parámetros")
-    periodo_ini=pd.Timestamp(st.date_input("Fecha inicio del periodo de cálculo", value=date(2026,5,1)))
-    periodo_fin=pd.Timestamp(st.date_input("Fecha fin del periodo de cálculo", value=date(2026,5,31)))
-    target_date=st.date_input("Mes a proyectar horas", value=date(2026,6,1))
-    pesos_horas=st.text_input("Pesos promedio ponderado horas", value="40,30,20,10")
-    smmlv=st.number_input("SMMLV", min_value=0, value=DEFAULT_SMMLV, step=1000, format="%d")
-    aux=st.number_input("Auxilio transporte legal", min_value=0, value=DEFAULT_AUX_TRANSPORTE, step=1000, format="%d")
-    seed=st.number_input("Semilla retiros proyectados", min_value=1, value=2026, step=1)
+    periodo_ini = pd.Timestamp(st.date_input("Fecha inicio del periodo de cálculo", value=date(2026, 5, 1)))
+    periodo_fin = pd.Timestamp(st.date_input("Fecha fin del periodo de cálculo", value=date(2026, 5, 31)))
+    smmlv = st.number_input("SMMLV", min_value=0, value=DEFAULT_SMMLV, step=1000, format="%d")
+    aux = st.number_input("Auxilio transporte legal", min_value=0, value=DEFAULT_AUX_TRANSPORTE, step=1000, format="%d")
+    seed = st.number_input("Semilla retiros proyectados", min_value=1, value=2026, step=1)
 
 st.subheader("1. Archivos principales")
-c1,c2,c3=st.columns(3)
-with c1: dkon_file=st.file_uploader("DKON", type=["xlsx","xlsm","xls"])
-with c2: md_ant_file=st.file_uploader("MD mes anterior", type=["xlsx","xlsm","xls"])
-with c3: md_act_file=st.file_uploader("MD mes actual", type=["xlsx","xlsm","xls"])
+c1, c2, c3 = st.columns(3)
+with c1:
+    dkon_file = st.file_uploader("DKON enriquecido", type=["xlsx", "xlsm", "xls"])
+with c2:
+    md_ant_file = st.file_uploader("MD mes anterior", type=["xlsx", "xlsm", "xls"])
+with c3:
+    md_act_file = st.file_uploader("MD mes actual", type=["xlsx", "xlsm", "xls"])
 
 st.subheader("2. Novedades")
-c4,c5,c6=st.columns(3)
-with c4: ger_file=st.file_uploader("Novedades Gerencia Administrativa", type=["xlsx","xlsm","xls"])
-with c5: cb_file=st.file_uploader("Compensación y Beneficios", type=["xlsx","xlsm","xls"])
-with c6: rules_file=st.file_uploader("Reglas de conceptos (opcional)", type=["xlsx","xlsm","xls"])
+c4, c5, c6 = st.columns(3)
+with c4:
+    ger_file = st.file_uploader("Novedades Gerencia Administrativa", type=["xlsx", "xlsm", "xls"])
+with c5:
+    cb_file = st.file_uploader("Compensación y Beneficios", type=["xlsx", "xlsm", "xls"])
+with c6:
+    horas_pagas_file = st.file_uploader("Horas pagas del mes", type=["xlsx", "xlsm", "xls"])
 
-c7,c8,c9=st.columns(3)
-with c7: it14_file=st.file_uploader("IT14", type=["xlsx","xlsm","xls"])
-with c8: it15_file=st.file_uploader("IT15", type=["xlsx","xlsm","xls"])
-with c9: horas_pagas_file=st.file_uploader("Horas pagas del mes", type=["xlsx","xlsm","xls"])
+c7, c8 = st.columns(2)
+with c7:
+    it14_file = st.file_uploader("IT14", type=["xlsx", "xlsm", "xls"])
+with c8:
+    it15_file = st.file_uploader("IT15", type=["xlsx", "xlsm", "xls"])
 
 st.subheader("3. Planta y días")
-c10,c11,c12,c13=st.columns(4)
-with c10: recl_file=st.file_uploader("Ingresos reclutamiento", type=["xlsx","xlsm","xls"])
-with c11: abs_file=st.file_uploader("Proyección ausentismos", type=["xlsx","xlsm","xls"])
-with c12: ret_real_file=st.file_uploader("Retiros reales / masterdata retiros", type=["xlsx","xlsm","xls"])
-with c13: ret_proy_file=st.file_uploader("Retiros proyectados por cargo", type=["xlsx","xlsm","xls"])
+c10, c11, c12, c13 = st.columns(4)
+with c10:
+    recl_file = st.file_uploader("Ingresos reclutamiento", type=["xlsx", "xlsm", "xls"])
+with c11:
+    abs_file = st.file_uploader("Proyección ausentismos", type=["xlsx", "xlsm", "xls"])
+with c12:
+    ret_real_file = st.file_uploader("Retiros reales / masterdata retiros", type=["xlsx", "xlsm", "xls"])
+with c13:
+    ret_proy_file = st.file_uploader("Retiros proyectados por cargo", type=["xlsx", "xlsm", "xls"])
 
-st.subheader("4. Proyección de horas del mes siguiente")
-hours_model_file=st.file_uploader("Archivo histórico/promedios ponderados de horas", type=["xlsx","xlsm","xls"])
-st.info("La hoja `LLEVAR_A_CALCULO` calcula cantidad de horas del mes siguiente. No entra a IBC ni prestaciones; sirve para el insumo financiero posterior.")
+st.subheader("4. Provisiones")
+prov_ant_file = st.file_uploader("Provisiones mes anterior (opcional)", type=["xlsx", "xlsm", "xls"])
+st.info("En esta versión se inhabilita la proyección de horas del mes siguiente y se elimina la carga de reglas externas. Las marcas de IBC/parafiscales/prestaciones/vacaciones vienen desde DKON.")
 
-if st.button("🚀 Generar base V5", type="primary"):
+if st.button("🚀 Generar base V5.2", type="primary"):
     if not dkon_file or not md_act_file:
-        st.error("Carga mínimo DKON y MD mes actual."); st.stop()
+        st.error("Carga mínimo DKON enriquecido y MD mes actual.")
+        st.stop()
     try:
-        dkon=build_dkon_matrix(dkon_file); rules=read_rules(rules_file, dkon)
-        md=read_md_dimension(md_act_file); md_con=read_md_active_concepts(md_act_file)
-        abs_df=read_absences(abs_file) if abs_file else pd.DataFrame(columns=["SAP","Dias_Ausentismo"])
-        ret_real=read_real_retires(ret_real_file) if ret_real_file else pd.DataFrame(columns=["SAP","Fecha_Retiro_Real"])
-        ret_proy=read_projected_retires(ret_proy_file) if ret_proy_file else pd.DataFrame()
-        md=apply_real_retires(md, ret_real); md, ret_sel, alert_ret=select_projected_retires(md, ret_proy, abs_df, int(seed))
-        ger=read_generic_concept_file(ger_file,"Gerencia Administrativa",periodo_ini,periodo_fin) if ger_file else pd.DataFrame()
-        cb=read_generic_concept_file(cb_file,"Compensación y Beneficios",periodo_ini,periodo_fin) if cb_file else pd.DataFrame()
-        it14=read_generic_concept_file(it14_file,"IT14",periodo_ini,periodo_fin,"IT14") if it14_file else pd.DataFrame()
-        it15=read_generic_concept_file(it15_file,"IT15",periodo_ini,periodo_fin,"IT15") if it15_file else pd.DataFrame()
-        hp=read_generic_concept_file(horas_pagas_file,"Horas pagas del mes",periodo_ini,periodo_fin) if horas_pagas_file else pd.DataFrame()
-        md, md_con, ger_extra=apply_salary_admin(md, md_con, ger)
-        recl_raw=read_recruitment_raw(recl_file) if recl_file else pd.DataFrame(); recl, missing=assign_recruitment_salary(recl_raw, md)
+        dkon = build_dkon_matrix(dkon_file)
+        md = read_md_dimension(md_act_file)
+        md_con = read_md_active_concepts(md_act_file)
+        abs_df = read_absences(abs_file) if abs_file else pd.DataFrame(columns=["SAP", "Dias_Ausentismo"])
+        ret_real = read_real_retires(ret_real_file) if ret_real_file else pd.DataFrame(columns=["SAP", "Fecha_Retiro_Real"])
+        ret_proy = read_projected_retires(ret_proy_file, periodo_fin) if ret_proy_file else pd.DataFrame()
+        prov_ant = read_previous_provisions(prov_ant_file) if prov_ant_file else pd.DataFrame()
+
+        md = apply_real_retires(md, ret_real)
+        md, ret_sel, alert_ret = select_projected_retires(md, ret_proy, abs_df, int(seed))
+
+        ger = read_generic_concept_file(ger_file, "Gerencia Administrativa", periodo_ini, periodo_fin) if ger_file else pd.DataFrame()
+        cb = read_generic_concept_file(cb_file, "Compensación y Beneficios", periodo_ini, periodo_fin) if cb_file else pd.DataFrame()
+        it14 = read_generic_concept_file(it14_file, "IT14", periodo_ini, periodo_fin, "IT14") if it14_file else pd.DataFrame()
+        it15 = read_generic_concept_file(it15_file, "IT15", periodo_ini, periodo_fin, "IT15") if it15_file else pd.DataFrame()
+        hp = read_generic_concept_file(horas_pagas_file, "Horas pagas del mes", periodo_ini, periodo_fin) if horas_pagas_file else pd.DataFrame()
+
+        md, md_con, ger_extra = apply_salary_admin(md, md_con, ger)
+        recl_raw = read_recruitment_raw(recl_file) if recl_file else pd.DataFrame()
+        recl, missing = assign_recruitment_salary(recl_raw, md)
         if not missing.empty:
-            st.warning("Hay cargos de ingresos que no existen en MD. Completa salario manual.")
-            edited=st.data_editor(missing, use_container_width=True, key="salary_editor")
-            manual=dict(zip(edited["Key_Manual"], edited["Salario_Manual"].map(to_number)))
-            recl, missing2=assign_recruitment_salary(recl_raw, md, manual)
+            st.warning("Hay cargos de ingresos que no existen en MD. Completa salario manual para continuar.")
+            edited = st.data_editor(missing, use_container_width=True, key="salary_editor")
+            manual = dict(zip(edited["Key_Manual"], edited["Salario_Manual"].map(to_number)))
+            recl, missing2 = assign_recruitment_salary(recl_raw, md, manual)
             if not missing2.empty:
-                st.error("Aún hay cargos sin salario manual."); st.stop()
-        base_md, md_days=calc_base_concepts(md, md_con, abs_df, periodo_ini, periodo_fin, smmlv, aux)
-        base_ing=calc_recruitment(recl, periodo_ini, periodo_fin, smmlv, aux) if not recl.empty else pd.DataFrame()
-        extras=[enrich_extra(x, md, periodo_ini) for x in [ger_extra, cb, it14, it15, hp] if x is not None and not x.empty]
-        base_extra=pd.concat(extras, ignore_index=True) if extras else pd.DataFrame()
-        parts=[x for x in [base_md, base_ing, base_extra] if x is not None and not x.empty]
-        base=pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(); base=add_rule_flags(base, rules)
-        cuentas, missing_dkon=homologate(base, dkon); ibc=build_ibc(base, smmlv)
-        resumen_cuenta=cuentas.groupby(["Tipo_CECO","Cuenta_DKON","Texto_Cuenta","Grupo_DKON"], as_index=False)["Valor"].sum() if not cuentas.empty else pd.DataFrame()
-        resumen_ceco=cuentas.groupby(["Tipo_CECO","CECO","Centro_Coste","Cuenta_DKON","Texto_Cuenta"], as_index=False)["Valor"].sum() if not cuentas.empty else pd.DataFrame()
-        resumen_fuente=base.groupby(["Fuente","Concepto"], as_index=False)["Valor"].sum() if not base.empty else pd.DataFrame()
-        comp_md=pd.DataFrame()
+                st.error("Aún hay cargos sin salario manual. Completa todos los salarios para generar la base.")
+                st.stop()
+
+        base_md, md_days = calc_base_concepts(md, md_con, abs_df, periodo_ini, periodo_fin, smmlv, aux)
+        base_ing = calc_recruitment(recl, periodo_ini, periodo_fin, smmlv, aux) if not recl.empty else pd.DataFrame()
+        extras = [enrich_extra(x, md, periodo_ini) for x in [ger_extra, cb, it14, it15, hp] if x is not None and not x.empty]
+        base_extra = pd.concat(extras, ignore_index=True) if extras else pd.DataFrame()
+        parts = [x for x in [base_md, base_ing, base_extra] if x is not None and not x.empty]
+        base_raw = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+        base, missing_dkon = attach_dkon_attributes(base_raw, dkon)
+        cuentas, _ = homologate(base, dkon)
+        ibc = build_ibc(base, smmlv)
+        base_paraf = build_base_flag(base, "Base_Parafiscales", "Base_Parafiscales_Valor", "Conceptos_Parafiscales")
+        base_prest = build_base_flag(base, "Base_Prestaciones", "Base_Prestaciones_Valor", "Conceptos_Prestaciones")
+        base_vac = build_base_flag(base, "Base_Vacaciones", "Base_Vacaciones_Valor", "Conceptos_Vacaciones")
+
+        resumen_cuenta = cuentas.groupby(["Tipo_CECO", "Cuenta_DKON", "Texto_Cuenta", "Grupo_DKON"], as_index=False)["Valor"].sum() if not cuentas.empty else pd.DataFrame()
+        resumen_ceco = cuentas.groupby(["Tipo_CECO", "CECO", "Centro_Coste", "Cuenta_DKON", "Texto_Cuenta"], as_index=False)["Valor"].sum() if not cuentas.empty else pd.DataFrame()
+        resumen_fuente = base.groupby(["Fuente", "Concepto"], as_index=False)["Valor"].sum() if not base.empty else pd.DataFrame()
+
+        resumen_hc = build_summary_hc(md, recl, ret_real, ret_sel)
+        resumen_aus = build_summary_absences(abs_df, md)
+        resumen_ing = build_summary_ingresos(recl)
+        resumen_ret = build_summary_retiros(ret_real, ret_sel, md)
+
+        comp_md = pd.DataFrame()
         if md_ant_file:
-            md_ant=read_md_dimension(md_ant_file)
-            ant=md_ant[["SAP","Nombre","CECO","Tipo_CECO","Salario_Total_MD","Cargo"]].rename(columns={"Nombre":"Nombre_Ant","CECO":"CECO_Ant","Tipo_CECO":"Tipo_CECO_Ant","Salario_Total_MD":"Salario_Ant","Cargo":"Cargo_Ant"})
-            act=md[["SAP","Nombre","CECO","Tipo_CECO","Salario_Total_MD","Cargo"]].rename(columns={"Nombre":"Nombre_Act","CECO":"CECO_Act","Tipo_CECO":"Tipo_CECO_Act","Salario_Total_MD":"Salario_Act","Cargo":"Cargo_Act"})
-            comp_md=ant.merge(act,on="SAP",how="outer"); comp_md["Estado"]=comp_md.apply(lambda r: "Nuevo" if pd.isna(r["CECO_Ant"]) else ("Salida" if pd.isna(r["CECO_Act"]) else "Continúa"), axis=1); comp_md["Dif_Salario"]=comp_md["Salario_Act"].fillna(0)-comp_md["Salario_Ant"].fillna(0)
-        llevar, mapa_cargos, alert_horas=project_hours(hours_model_file, md, recl, target_date.year, target_date.month, pesos_horas) if hours_model_file else (pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
-        alertas=build_alerts(md, base, missing_dkon, [alert_ret, alert_horas])
-        st.success("Base V5 generada correctamente.")
-        m1,m2,m3,m4,m5,m6=st.columns(6); m1.metric("Conceptos DKON", f"{dkon['Concepto'].nunique():,}"); m2.metric("HC MD", f"{md['SAP'].nunique():,}"); m3.metric("Detalle", f"{len(base):,}"); m4.metric("Ingresos", f"{len(recl):,}" if not recl.empty else "0"); m5.metric("Retiros proy.", f"{len(ret_sel):,}" if not ret_sel.empty else "0"); m6.metric("Alertas", f"{len(alertas):,}")
-        tabs=st.tabs(["Detalle", "Cuentas", "Resumen cuenta", "IBC preliminar", "LLEVAR_A_CALCULO", "Alertas"])
-        with tabs[0]: st.dataframe(base.head(200), use_container_width=True)
-        with tabs[1]: st.dataframe(cuentas.head(200), use_container_width=True)
-        with tabs[2]: st.dataframe(resumen_cuenta, use_container_width=True)
-        with tabs[3]: st.dataframe(ibc, use_container_width=True)
-        with tabs[4]: st.dataframe(llevar, use_container_width=True)
-        with tabs[5]: st.dataframe(alertas, use_container_width=True)
-        dfs={"MATRIZ_DKON_Y":dkon,"REGLAS_CONCEPTOS":rules,"MD_NORMALIZADO":md,"MD_DIAS_CALCULADOS":md_days,"AUSENTISMOS_RESUMEN":abs_df,"RETIROS_REALES":ret_real,"RETIROS_PROYECTADOS":ret_proy,"RETIROS_SELECCIONADOS":ret_sel,"INGRESOS_PROYECTADOS":recl,"NOVEDADES_GERENCIA":ger,"COMP_BENEFICIOS":cb,"IT14_FILTRADO":it14,"IT15_FILTRADO":it15,"HORAS_PAGAS_MES":hp,"BASE_DETALLE_CONCEPTO":base,"BASE_CUENTAS_DKON":cuentas,"BASE_IBC_PRELIMINAR":ibc,"LLEVAR_A_CALCULO":llevar,"MAPA_CARGOS_HORAS":mapa_cargos,"RESUMEN_CUENTA":resumen_cuenta,"RESUMEN_CECO":resumen_ceco,"RESUMEN_FUENTE":resumen_fuente,"COMPARATIVO_MD":comp_md,"ALERTAS":alertas}
-        st.download_button("📥 Descargar base Excel V5", data=build_excel(dfs), file_name=f"base_proyeccion_costos_v5_{periodo_ini.strftime('%Y_%m')}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+            md_ant = read_md_dimension(md_ant_file)
+            ant = md_ant[["SAP", "Nombre", "CECO", "Tipo_CECO", "Salario_Total_MD", "Cargo"]].rename(columns={"Nombre": "Nombre_Ant", "CECO": "CECO_Ant", "Tipo_CECO": "Tipo_CECO_Ant", "Salario_Total_MD": "Salario_Ant", "Cargo": "Cargo_Ant"})
+            act = md[["SAP", "Nombre", "CECO", "Tipo_CECO", "Salario_Total_MD", "Cargo"]].rename(columns={"Nombre": "Nombre_Act", "CECO": "CECO_Act", "Tipo_CECO": "Tipo_CECO_Act", "Salario_Total_MD": "Salario_Act", "Cargo": "Cargo_Act"})
+            comp_md = ant.merge(act, on="SAP", how="outer")
+            comp_md["Estado"] = comp_md.apply(lambda r: "Nuevo" if pd.isna(r["CECO_Ant"]) else ("Salida" if pd.isna(r["CECO_Act"]) else "Continúa"), axis=1)
+            comp_md["Dif_Salario"] = comp_md["Salario_Act"].fillna(0) - comp_md["Salario_Ant"].fillna(0)
+
+        alertas = build_alerts(md, base, missing_dkon, [alert_ret])
+        st.success("Base V5.2 generada correctamente.")
+
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Conceptos DKON", f"{dkon['Concepto'].nunique():,}")
+        m2.metric("HC MD", f"{md['SAP'].nunique():,}")
+        m3.metric("Detalle", f"{len(base):,}")
+        m4.metric("Ingresos", f"{len(recl):,}" if not recl.empty else "0")
+        m5.metric("Retiros proy.", f"{len(ret_sel):,}" if not ret_sel.empty else "0")
+        m6.metric("Alertas", f"{len(alertas):,}")
+
+        tabs = st.tabs(["Detalle", "Cuentas", "IBC", "Parafiscales", "Prestaciones", "Vacaciones", "Resumen planta", "Alertas"])
+        with tabs[0]: st.dataframe(base.head(300), use_container_width=True)
+        with tabs[1]: st.dataframe(cuentas.head(300), use_container_width=True)
+        with tabs[2]: st.dataframe(ibc, use_container_width=True)
+        with tabs[3]: st.dataframe(base_paraf, use_container_width=True)
+        with tabs[4]: st.dataframe(base_prest, use_container_width=True)
+        with tabs[5]: st.dataframe(base_vac, use_container_width=True)
+        with tabs[6]:
+            st.write("HC")
+            st.dataframe(resumen_hc, use_container_width=True)
+            st.write("Ausentismos")
+            st.dataframe(resumen_aus, use_container_width=True)
+            st.write("Ingresos")
+            st.dataframe(resumen_ing, use_container_width=True)
+            st.write("Retiros")
+            st.dataframe(resumen_ret, use_container_width=True)
+        with tabs[7]: st.dataframe(alertas, use_container_width=True)
+
+        dfs = {
+            "MATRIZ_DKON_Y": dkon,
+            "MD_NORMALIZADO": md,
+            "MD_DIAS_CALCULADOS": md_days,
+            "AUSENTISMOS_RESUMEN": abs_df,
+            "RETIROS_REALES": ret_real,
+            "RETIROS_PROYECTADOS": ret_proy,
+            "RETIROS_SELECCIONADOS": ret_sel,
+            "INGRESOS_PROYECTADOS": recl,
+            "NOVEDADES_GERENCIA": ger,
+            "COMP_BENEFICIOS": cb,
+            "IT14_FILTRADO": it14,
+            "IT15_FILTRADO": it15,
+            "HORAS_PAGAS_MES": hp,
+            "PROVISIONES_MES_ANT": prov_ant,
+            "BASE_DETALLE_CONCEPTO": base,
+            "BASE_CUENTAS_DKON": cuentas,
+            "BASE_IBC": ibc,
+            "BASE_PARAFISCALES": base_paraf,
+            "BASE_PRESTACIONES_INSUMO": base_prest,
+            "BASE_VACACIONES_INSUMO": base_vac,
+            "RESUMEN_CUENTA": resumen_cuenta,
+            "RESUMEN_CECO": resumen_ceco,
+            "RESUMEN_FUENTE": resumen_fuente,
+            "RESUMEN_HC": resumen_hc,
+            "RESUMEN_AUSENTISMOS": resumen_aus,
+            "RESUMEN_INGRESOS": resumen_ing,
+            "RESUMEN_RETIROS": resumen_ret,
+            "COMPARATIVO_MD": comp_md,
+            "ALERTAS": alertas,
+        }
+        st.download_button(
+            "📥 Descargar base Excel V5.2",
+            data=build_excel(dfs),
+            file_name=f"base_proyeccion_costos_v5_2_{periodo_ini.strftime('%Y_%m')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
     except Exception as e:
-        st.exception(e); st.error("Se presentó un error. Revisa hojas y columnas esperadas.")
+        st.exception(e)
+        st.error("Se presentó un error. Revisa hojas y columnas esperadas.")
 
 st.markdown('<div class="footer">Creado por Andrés Huérfano Dávila – Nómina JMC</div>', unsafe_allow_html=True)
