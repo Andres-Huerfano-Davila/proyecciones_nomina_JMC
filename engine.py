@@ -384,26 +384,150 @@ def read_absences(file):
         if mask.sum() > 0: out = out[mask]
     return out[out["SAP"] != ""].groupby("SAP", as_index=False)["Dias_Ausentismo"].sum()
 
+def extract_concept_from_text(text: str) -> str:
+    """Extrae un concepto SAP de un texto de encabezado.
+
+    Soporta plantillas anchas donde el código viene en la fila superior, por ejemplo
+    `Y617 Bono Antigüedad Operación`, o en el encabezado de columna.
+    Si hay varios códigos en la misma celda, usa el primero como regla prudente.
+    """
+    t = str(text or "").upper()
+    # Primero conceptos especiales alfanuméricos conocidos.
+    m = re.search(r"\b(YM01|Y[A-Z0-9]{3,4}|T\d{3})\b", t)
+    if m:
+        return m.group(1).strip().upper()
+    return ""
+
+def detect_employee_header_row(file, sheet, max_rows=25) -> int:
+    """Detecta encabezado para archivos de novedades.
+
+    La detección anterior podía escoger la fila del título porque contenía la palabra
+    `Nómina`. Para plantillas JMC se prioriza una fila que tenga SAP/Nº pers.
+    y campos de identificación como nombre/ceco/cargo.
+    """
+    file.seek(0)
+    raw = pd.read_excel(file, sheet_name=sheet, header=None, nrows=max_rows, dtype=str)
+    best, best_score = 0, -1
+    for idx, row in raw.iterrows():
+        vals = [norm_col(v) for v in row.tolist() if pd.notna(v)]
+        joined = "|".join(vals)
+        has_sap = any(v in {"sap", "n_pers", "n_pers", "numero_de_personal", "numero_personal", "pernr"} or v.endswith("_pers") for v in vals)
+        score = 0
+        if has_sap: score += 10
+        if any("nombre" in v for v in vals): score += 3
+        if any(v in {"centro_de_costos", "centro_de_costo", "ceco", "ce_coste", "centro_de_coste"} for v in vals): score += 3
+        if any("cargo" in v or "funcion" in v for v in vals): score += 2
+        if any("concepto" in v or "cc_nomina" in v or "importe" in v or "valor" in v for v in vals): score += 2
+        if score > best_score:
+            best, best_score = idx, score
+    if best_score <= 0:
+        return detect_header_row(file, sheet, ["sap", "cc", "valor", "importe", "nº"] )
+    return int(best)
+
 def read_generic_concept_file(file, fuente, periodo_ini, periodo_fin, kind=""):
-    if file is None: return pd.DataFrame()
-    sheets = safe_sheet_names(file); sheet = next((s for s in ["Novedades","IT 14","IT14","IT 15","IT15","Sheet1"] if s in sheets), sheets[0])
-    header = detect_header_row(file, sheet, ["sap", "cc", "valor", "importe", "nº"])
+    """Lee novedades en formato largo o en plantilla ancha JMC.
+
+    Formato largo esperado:
+      SAP | Concepto/CC-nómina | Valor/Importe | Fecha/Desde/Hasta
+
+    Formato ancho JMC esperado:
+      Fila superior con códigos (`Y617 Bono...`) y fila de encabezado con
+      `SAP`, `Nombres`, `Centro de Costos`, `Cargo`, etc. Cada columna de valor
+      se derrite a registros concepto-valor. Esto evita errores como
+      `No encontré columna SAP` cuando el detector tomaba la fila de título.
+    """
+    if file is None:
+        return pd.DataFrame()
+
+    sheets = safe_sheet_names(file)
+    if not sheets:
+        return pd.DataFrame()
+    preferred = ["Novedades", "IT 14", "IT14", "IT 15", "IT15", "Sheet1", "Hoja1"]
+    sheet = next((s for s in preferred if s in sheets), sheets[0])
+    header = detect_employee_header_row(file, sheet)
     df = read_sheet(file, sheet, header)
-    c_sap = find_col(df, ["SAP", "Nº pers.", "N° pers.", "Número de personal"], True)
-    c_con = find_col(df, ["CC-nómina", "CC nomina", "Concepto", "CC"], True)
-    c_val = find_col(df, ["Valor", "Importe", "Monto", "Pago", "Total"], True)
-    c_txt = find_col(df, ["Texto", "Texto concepto", "CC-nómina_2", "Denominación"])
-    c_fecha = find_col(df, ["Fecha", "Fecha pago", "Fecha de pago"]); c_desde = find_col(df, ["Desde", "Fecha desde"]); c_hasta = find_col(df, ["Hasta", "Fecha hasta"]); c_cant = find_col(df, ["Cantidad", "Cant", "Horas"])
-    out = pd.DataFrame(); out["SAP"] = df[c_sap].map(to_sap); out["Concepto"] = df[c_con].map(to_concept); out["Valor"] = df[c_val].map(to_number)
-    out["Texto_Concepto"] = df[c_txt].fillna("").astype(str).str.strip() if c_txt else ""; out["Cantidad"] = df[c_cant].map(to_number) if c_cant else 0.0
-    out["Fecha"] = to_datetime_series(df[c_fecha]) if c_fecha else pd.NaT; out["Desde"] = to_datetime_series(df[c_desde]) if c_desde else pd.NaT; out["Hasta"] = to_datetime_series(df[c_hasta]) if c_hasta else pd.NaT
-    out["Fuente"] = fuente; out["Periodo"] = periodo_ini.strftime("%Y-%m")
-    out = out[(out["SAP"] != "") & out["Concepto"].str.startswith("Y") & (out["Valor"] != 0)]
-    if kind == "IT14":
-        out = out[(out["Desde"].isna() | (out["Desde"] <= periodo_fin)) & (out["Hasta"].isna() | (out["Hasta"] >= periodo_ini) | (out["Hasta"].dt.year >= 9999))]
-    if kind == "IT15" and out["Fecha"].notna().any():
-        out = out[(out["Fecha"] >= periodo_ini) & (out["Fecha"] <= periodo_fin)]
-    return out.reset_index(drop=True)
+    df = df.loc[:, ~pd.Series(df.columns).astype(str).str.startswith("Unnamed:").values].copy() if not df.empty else df
+
+    c_sap = find_col(df, ["SAP", "Nº pers.", "N° pers.", "Nº pers", "N° pers", "Numero de personal", "Número de personal", "PERNR"], False)
+    if not c_sap:
+        # Último intento: primera columna con números SAP de 6+ dígitos.
+        for c in df.columns:
+            sample = df[c].dropna().astype(str).head(30).map(to_sap)
+            if (sample.str.len() >= 6).sum() >= max(3, min(8, len(sample))):
+                c_sap = c
+                break
+    if not c_sap:
+        raise ValueError(f"No encontré columna SAP en {fuente}. Revisa que el archivo tenga SAP/Nº pers. o carga la hoja correcta.")
+
+    c_con = find_col(df, ["CC-nómina", "CC nomina", "CC nómina", "CC-n", "CC-n.", "Concepto", "Concepto SAP", "CC"], False)
+    c_val = find_col(df, ["Valor", "Importe", "Monto", "Pago", "Total", "Valor total"], False)
+    c_txt = find_col(df, ["Texto", "Texto concepto", "CC-nómina_2", "Denominación", "Denominacion"], False)
+    c_fecha = find_col(df, ["Fecha", "Fecha pago", "Fecha de pago"], False)
+    c_desde = find_col(df, ["Desde", "Fecha desde", "Inicio"], False)
+    c_hasta = find_col(df, ["Hasta", "Fecha hasta", "Fin"], False)
+    c_cant = find_col(df, ["Cantidad", "Cant", "Horas"], False)
+
+    # ---------------- Formato largo ----------------
+    if c_con and c_val:
+        out = pd.DataFrame()
+        out["SAP"] = df[c_sap].map(to_sap)
+        out["Concepto"] = df[c_con].map(to_concept)
+        out["Valor"] = df[c_val].map(to_number)
+        out["Texto_Concepto"] = df[c_txt].fillna("").astype(str).str.strip() if c_txt else ""
+        out["Cantidad"] = df[c_cant].map(to_number) if c_cant else 0.0
+        out["Fecha"] = to_datetime_series(df[c_fecha]) if c_fecha else pd.NaT
+        out["Desde"] = to_datetime_series(df[c_desde]) if c_desde else pd.NaT
+        out["Hasta"] = to_datetime_series(df[c_hasta]) if c_hasta else pd.NaT
+        out["Fuente"] = fuente
+        out["Periodo"] = periodo_ini.strftime("%Y-%m")
+        out = out[(out["SAP"] != "") & out["Concepto"].str.startswith(("Y", "T")) & (out["Valor"] != 0)]
+        if kind == "IT14":
+            out = out[(out["Desde"].isna() | (out["Desde"] <= periodo_fin)) & (out["Hasta"].isna() | (out["Hasta"] >= periodo_ini) | (out["Hasta"].dt.year >= 9999))]
+        if kind == "IT15" and out["Fecha"].notna().any():
+            out = out[(out["Fecha"] >= periodo_ini) & (out["Fecha"] <= periodo_fin)]
+        return out.reset_index(drop=True)
+
+    # ---------------- Formato ancho de plantillas JMC ----------------
+    file.seek(0)
+    raw = pd.read_excel(file, sheet_name=sheet, header=None, dtype=str, nrows=max(header + 1, 1))
+    pre_header = raw.iloc[header - 1].tolist() if header > 0 and len(raw) >= header else [""] * len(df.columns)
+
+    c_nombre = find_col(df, ["Nombres", "Nombre", "Número de personal", "Empleado"], False)
+    c_ceco = find_col(df, ["Centro de Costos", "Centro de Costo", "CECO", "Ce.coste", "Centro de coste"], False)
+    c_cargo = find_col(df, ["Cargo", "Función", "Funcion", "Posición", "Posicion"], False)
+
+    id_cols = {c for c in [c_sap, c_nombre, c_ceco, c_cargo, find_col(df,["Region", "Región"], False), find_col(df,["Nivel"], False)] if c}
+    rows = []
+    for pos, col in enumerate(df.columns):
+        if col in id_cols:
+            continue
+        top = pre_header[pos] if pos < len(pre_header) else ""
+        concept = extract_concept_from_text(f"{top} {col}")
+        # Columnas de incremento que en plantilla no traen código limpio. Por defecto son salario básico.
+        if not concept and any(k in norm_text(col) for k in ["incremento salario", "incremento promocion", "incremento periodo de prueba"]):
+            concept = "Y010"
+        if not concept:
+            continue
+        vals = df[col].map(to_number)
+        mask = vals.ne(0) & df[c_sap].map(to_sap).ne("")
+        if not mask.any():
+            continue
+        tmp = pd.DataFrame({
+            "SAP": df.loc[mask, c_sap].map(to_sap),
+            "Concepto": concept,
+            "Valor": vals.loc[mask].astype(float),
+            "Texto_Concepto": str(col),
+            "Cantidad": 0.0,
+            "Fecha": pd.NaT,
+            "Desde": pd.NaT,
+            "Hasta": pd.NaT,
+            "Fuente": fuente,
+            "Periodo": periodo_ini.strftime("%Y-%m"),
+        })
+        rows.append(tmp)
+    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["SAP", "Concepto", "Valor", "Texto_Concepto", "Cantidad", "Fecha", "Desde", "Hasta", "Fuente", "Periodo"])
+    out = out[(out["SAP"] != "") & out["Concepto"].str.startswith(("Y", "T")) & (out["Valor"] != 0)].reset_index(drop=True)
+    return out
 
 def read_real_retires(file):
     if file is None: return pd.DataFrame(columns=["SAP", "Fecha_Retiro_Real"])
@@ -1228,26 +1352,39 @@ def run_module1_projection(files, params):
     smmlv = float(params.get("smmlv", DEFAULT_SMMLV))
     aux = float(params.get("aux", DEFAULT_AUX_TRANSPORTE))
     seed = int(params.get("seed", 2026))
+    read_alerts = []
+
+    def safe_read(label, reader, empty=None):
+        try:
+            return reader()
+        except Exception as e:
+            read_alerts.append(pd.DataFrame([{
+                "Tipo": "Error lectura archivo",
+                "SAP": "",
+                "Detalle": f"{label}: {str(e)[:250]}",
+                "Valor": None,
+            }]))
+            return empty if empty is not None else pd.DataFrame()
 
     dkon = build_dkon_matrix(files["dkon"])
     md = read_md_dimension(files["md_act"])
     md_con = read_md_active_concepts(files["md_act"])
-    abs_df = read_absences(files.get("aus")) if files.get("aus") else pd.DataFrame(columns=["SAP", "Dias_Ausentismo"])
-    ret_real = read_real_retires(files.get("ret_real")) if files.get("ret_real") else pd.DataFrame(columns=["SAP", "Fecha_Retiro_Real"])
-    ret_proy = read_projected_retires(files.get("ret_proy"), periodo_fin) if files.get("ret_proy") else pd.DataFrame()
-    prov_ant = read_previous_provisions(files.get("prov_ant")) if files.get("prov_ant") else pd.DataFrame()
+    abs_df = safe_read("Ausentismos", lambda: read_absences(files.get("aus")), pd.DataFrame(columns=["SAP", "Dias_Ausentismo"])) if files.get("aus") else pd.DataFrame(columns=["SAP", "Dias_Ausentismo"])
+    ret_real = safe_read("Retiros reales", lambda: read_real_retires(files.get("ret_real")), pd.DataFrame(columns=["SAP", "Fecha_Retiro_Real"])) if files.get("ret_real") else pd.DataFrame(columns=["SAP", "Fecha_Retiro_Real"])
+    ret_proy = safe_read("Retiros proyectados", lambda: read_projected_retires(files.get("ret_proy"), periodo_fin), pd.DataFrame()) if files.get("ret_proy") else pd.DataFrame()
+    prov_ant = safe_read("Provisiones mes anterior", lambda: read_previous_provisions(files.get("prov_ant")), pd.DataFrame()) if files.get("prov_ant") else pd.DataFrame()
 
     md = apply_real_retires(md, ret_real)
     md, ret_sel, alert_ret = select_projected_retires(md, ret_proy, abs_df, seed)
 
-    ger = read_generic_concept_file(files.get("ger"), "Gerencia Administrativa", periodo_ini, periodo_fin) if files.get("ger") else pd.DataFrame()
-    cb = read_generic_concept_file(files.get("cb"), "Compensación y Beneficios", periodo_ini, periodo_fin) if files.get("cb") else pd.DataFrame()
-    it14 = read_generic_concept_file(files.get("it14"), "IT14", periodo_ini, periodo_fin, "IT14") if files.get("it14") else pd.DataFrame()
-    it15 = read_generic_concept_file(files.get("it15"), "IT15", periodo_ini, periodo_fin, "IT15") if files.get("it15") else pd.DataFrame()
-    hp = read_generic_concept_file(files.get("horas"), "Horas pagas del mes", periodo_ini, periodo_fin) if files.get("horas") else pd.DataFrame()
+    ger = safe_read("Novedades Gerencia Administrativa", lambda: read_generic_concept_file(files.get("ger"), "Gerencia Administrativa", periodo_ini, periodo_fin), pd.DataFrame()) if files.get("ger") else pd.DataFrame()
+    cb = safe_read("Compensación y Beneficios", lambda: read_generic_concept_file(files.get("cb"), "Compensación y Beneficios", periodo_ini, periodo_fin), pd.DataFrame()) if files.get("cb") else pd.DataFrame()
+    it14 = safe_read("IT14", lambda: read_generic_concept_file(files.get("it14"), "IT14", periodo_ini, periodo_fin, "IT14"), pd.DataFrame()) if files.get("it14") else pd.DataFrame()
+    it15 = safe_read("IT15", lambda: read_generic_concept_file(files.get("it15"), "IT15", periodo_ini, periodo_fin, "IT15"), pd.DataFrame()) if files.get("it15") else pd.DataFrame()
+    hp = safe_read("Horas pagas del mes", lambda: read_generic_concept_file(files.get("horas"), "Horas pagas del mes", periodo_ini, periodo_fin), pd.DataFrame()) if files.get("horas") else pd.DataFrame()
 
     md, md_con, ger_extra = apply_salary_admin(md, md_con, ger)
-    recl_raw = read_recruitment_raw(files.get("recl")) if files.get("recl") else pd.DataFrame()
+    recl_raw = safe_read("Ingresos reclutamiento", lambda: read_recruitment_raw(files.get("recl")), pd.DataFrame()) if files.get("recl") else pd.DataFrame()
     recl, missing_salary = assign_recruitment_salary(recl_raw, md)
 
     base_md, md_days = calc_base_concepts(md, md_con, abs_df, periodo_ini, periodo_fin, smmlv, aux)
@@ -1290,7 +1427,7 @@ def run_module1_projection(files, params):
         comp_md["Estado"] = comp_md.apply(lambda r: "Nuevo" if pd.isna(r.get("CECO_Ant")) else ("Salida" if pd.isna(r.get("CECO_Act")) else "Continúa"), axis=1)
         comp_md["Dif_Salario"] = comp_md["Salario_Act"].fillna(0) - comp_md["Salario_Ant"].fillna(0)
 
-    alertas = build_alerts(md, base, missing_dkon, [alert_ret])
+    alertas = build_alerts(md, base, missing_dkon, [alert_ret] + read_alerts)
     if missing_salary is not None and not missing_salary.empty:
         miss = missing_salary.copy(); miss["Tipo"] = "Ingreso sin salario referencia"; miss["SAP"] = ""; miss["Detalle"] = miss.apply(lambda r: f"{r.get('Cargo')} / {r.get('Tipo_CECO')} / {r.get('Area_Nomina')}", axis=1); miss["Valor"] = 0
         alertas = pd.concat([alertas, miss[["Tipo", "SAP", "Detalle", "Valor"]]], ignore_index=True)
