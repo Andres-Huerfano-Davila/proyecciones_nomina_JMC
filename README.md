@@ -1,18 +1,25 @@
-# Modelo Integral Proyecciones Nómina JMC
+# Modelo Integral Proyecciones Nómina JMC V1.3
 
-App Streamlit integral para proyección de costos de nómina JMC.
+Versión modular por pestañas.
 
-## Módulos incluidos
+## Qué cambia frente a V1.2
 
-1. **Devengos proyectados**: motor central de cálculo con MD, ingresos, retiros, ausentismos, IT14, IT15, C&B, Gerencia, horas pagas y DKON desde el inicio.
-2. **Seguridad social y parafiscales**: calcula IBC, Ley 1393, salud, pensión, ARL por cargo, caja, SENA e ICBF.
-3. **Prestaciones sociales**: genera bases promedio de prima y cesantías con CWTR, histórico de salarios y fecha de evaluación.
-4. **Vacaciones**: calcula base móvil de vacaciones de 12 meses.
-5. **Consolidación final**: unifica todos los módulos por SAP + CECO + Tipo CECO + Cuenta DKON + Fuente + Valor.
+- Los módulos ya no se cargan ni ejecutan todos en una sola pantalla.
+- Cada módulo tiene su propia pestaña, botón de ejecución y descarga de Excel.
+- Si un módulo falla, no se pierden las salidas de los módulos ya calculados.
+- El usuario puede revisar/comparar cada salida contra su plantilla base antes de continuar.
+- El DKON se carga desde el inicio y se usa desde el Módulo 1 para cuentas y marcas.
 
-## Archivos principales
+## Flujo
 
-Subir en la raíz del repositorio:
+1. Parametrización: DKON, MD actual y MD anterior.
+2. Devengos proyectados: cálculo central tipo Proyección Costos.
+3. Seguridad social y parafiscales: desde la salida del módulo 1.
+4. Prestaciones: bases de prima y cesantías.
+5. Vacaciones: base móvil 12 meses.
+6. Consolidación final: une las salidas disponibles por cuenta DKON.
+
+## Archivos raíz para Streamlit Cloud
 
 - app.py
 - engine.py
@@ -20,5 +27,5 @@ Subir en la raíz del repositorio:
 - runtime.txt
 - packages.txt
 - README.md
+- .streamlit/config.toml
 
-Main file en Streamlit Cloud: `app.py`.

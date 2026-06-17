@@ -860,6 +860,165 @@ def build_alerts(md, base, missing, extras):
 # MOTOR INTEGRAL V1 - MÓDULOS COMPLETOS
 # ============================================================
 
+
+def uploaded_size_mb(file) -> float:
+    """Tamaño aproximado del archivo cargado sin duplicarlo en memoria."""
+    try:
+        return float(getattr(file, "size", 0) or 0) / 1024 / 1024
+    except Exception:
+        return 0.0
+
+
+def _iter_uploaded_lines(file, encoding="latin-1"):
+    """Itera líneas de un UploadedFile/BytesIO sin usar getvalue()."""
+    file.seek(0)
+    while True:
+        raw = file.readline()
+        if not raw:
+            break
+        if isinstance(raw, bytes):
+            yield raw.decode(encoding, errors="ignore").rstrip("\r\n")
+        else:
+            yield str(raw).rstrip("\r\n")
+    file.seek(0)
+
+
+def _split_sap_pipe_line(line: str):
+    return [p.strip() for p in line.strip().strip("|").split("|")]
+
+
+def _is_separator_parts(parts):
+    if not parts:
+        return True
+    joined = "".join(parts).replace("-", "").replace("_", "").strip()
+    return not joined or all(re.fullmatch(r"[-_ ]*", p or "-") for p in parts)
+
+
+def _detect_large_text_format(file, sample_lines=250):
+    """Detecta formato texto grande: SAP pipe o CSV con separador común."""
+    lines = []
+    for i, ln in enumerate(_iter_uploaded_lines(file)):
+        if i >= sample_lines:
+            break
+        if ln.strip():
+            lines.append(ln)
+    pipe_lines = [ln for ln in lines if "|" in ln]
+    if len(pipe_lines) >= 3:
+        return "sap_pipe", "|", lines
+    # Delimitadores planos
+    candidates = [";", "\t", ",", "|"]
+    best_sep, best_count = ";", 0
+    for sep in candidates:
+        count = max([len(ln.split(sep)) for ln in lines[:50]] or [0])
+        if count > best_count:
+            best_sep, best_count = sep, count
+    return "delimited", best_sep, lines
+
+
+def _find_header_in_pipe_lines(lines):
+    header_idx = None
+    header = None
+    for i, ln in enumerate(lines):
+        if "|" not in ln:
+            continue
+        parts = _split_sap_pipe_line(ln)
+        jt = norm_text(" ".join(parts))
+        if any(k in jt for k in ["pers", "pernr", "importe", "valor", "cc-n", "nomina", "concepto", "fecha"]):
+            header_idx = i
+            header = parts
+            break
+    return header_idx, header
+
+
+def _large_text_to_concepts(file, fuente, periodo_ini=None, periodo_fin=None, filter_concepts=None):
+    """Lector liviano para TXT/CSV grandes. Devuelve solo columnas necesarias y puede filtrar conceptos."""
+    fmt, sep, sample = _detect_large_text_format(file)
+    filter_concepts = set(filter_concepts or [])
+    if fmt == "sap_pipe":
+        _, header = _find_header_in_pipe_lines(sample)
+        if not header:
+            return pd.DataFrame(columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente"])
+        hnorm = [norm_col(h) for h in header]
+        def idx(cands):
+            cands_n = [norm_col(c) for c in cands]
+            for cn in cands_n:
+                for i, hn in enumerate(hnorm):
+                    if cn == hn or cn in hn or hn in cn:
+                        return i
+            return None
+        i_sap = idx(["SAP", "Nº pers.", "Nº pers", "Numero de personal", "Número de personal", "PERNR"])
+        i_con = idx(["Concepto", "CC-nómina", "CC-nomina", "CC-n.", "CC-n", "CC nomina", "Cód.Concepto"])
+        i_txt = idx(["Texto", "Texto_Concepto", "Txt.CC-nóm.", "Txt.CC-nom.", "Texto expl.CC-nómina", "Denominación", "Descripcion", "Descripción"])
+        i_val = idx(["Valor", "Importe", "Monto", "Devengo", "Pago", "Valor Proyectado", "Importe_Mensual"])
+        i_fecha = idx(["Fecha pago", "Fecha de pago", "Fecha", "Periodo", "Mes", "Fecha_Pago", "Fe.pago", "Fe contab", "Fecha contab"])
+        if i_sap is None or i_con is None or i_val is None:
+            return pd.DataFrame(columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente"])
+        rows=[]
+        ncols=len(header)
+        for ln in _iter_uploaded_lines(file):
+            if "|" not in ln:
+                continue
+            parts=_split_sap_pipe_line(ln)
+            if len(parts) != ncols or _is_separator_parts(parts):
+                continue
+            # saltar encabezado repetido
+            if norm_text(" ".join(parts)) == norm_text(" ".join(header)):
+                continue
+            sap=to_sap(parts[i_sap])
+            con=to_concept(parts[i_con])
+            if not sap or not con:
+                continue
+            if filter_concepts and con not in filter_concepts:
+                continue
+            val=to_number(parts[i_val])
+            if val == 0:
+                continue
+            fecha = pd.to_datetime(parts[i_fecha], errors="coerce", dayfirst=True).normalize() if i_fecha is not None else pd.NaT
+            if periodo_ini is not None and periodo_fin is not None and pd.notna(fecha):
+                if fecha < pd.Timestamp(periodo_ini) or fecha > pd.Timestamp(periodo_fin):
+                    continue
+            rows.append({"SAP":sap,"Concepto":con,"Texto_Concepto":parts[i_txt] if i_txt is not None else parts[i_con],"Valor":val,"Fecha_Pago":fecha,"Fuente":fuente})
+        return pd.DataFrame(rows, columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente"])
+    # CSV/TXT plano: usar chunks para no cargar completo
+    try:
+        file.seek(0)
+        chunks=[]
+        reader = pd.read_csv(file, sep=sep, dtype=object, encoding="latin-1", chunksize=200_000, engine="python")
+        c_info=None
+        for chunk in reader:
+            chunk.columns=[str(c).strip() for c in chunk.columns]
+            if c_info is None:
+                c_sap = find_col(chunk, ["SAP", "Nº pers.", "Nº pers", "Numero de personal", "Número de personal", "PERNR"], False)
+                c_con = find_col(chunk, ["Concepto", "CC-nómina", "CC-nomina", "CC-n.", "CC-n", "CC nomina", "CC nom", "Cód.Concepto"], False)
+                c_text = find_col(chunk, ["Texto", "Texto_Concepto", "Txt.CC-nóm.", "Txt.CC-nom.", "Texto expl.CC-nómina", "Denominación", "Descripcion", "Descripción"], False)
+                c_val = find_col(chunk, ["Valor", "Importe", "Monto", "Devengo", "Pago", "Valor Proyectado", "Importe_Mensual"], False)
+                c_fecha = find_col(chunk, ["Fecha pago", "Fecha de pago", "Fecha", "Periodo", "Mes", "Fecha_Pago"], False)
+                c_info=(c_sap,c_con,c_text,c_val,c_fecha)
+                if not c_sap or not c_con or not c_val:
+                    return pd.DataFrame(columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente"])
+            c_sap,c_con,c_text,c_val,c_fecha=c_info
+            out=pd.DataFrame({
+                "SAP": chunk[c_sap].map(to_sap),
+                "Concepto": chunk[c_con].map(to_concept),
+                "Texto_Concepto": chunk[c_text].astype(str).fillna("") if c_text else chunk[c_con].astype(str),
+                "Valor": chunk[c_val].map(to_number),
+                "Fecha_Pago": to_datetime_series(chunk[c_fecha]) if c_fecha else pd.NaT,
+                "Fuente": fuente,
+            })
+            out=out[(out["SAP"]!="") & (out["Concepto"]!="") & (out["Valor"]!=0)].copy()
+            if filter_concepts:
+                out=out[out["Concepto"].isin(filter_concepts)].copy()
+            if periodo_ini is not None and periodo_fin is not None and c_fecha:
+                mask=out["Fecha_Pago"].notna()
+                out=out[(~mask)|((out["Fecha_Pago"]>=pd.Timestamp(periodo_ini))&(out["Fecha_Pago"]<=pd.Timestamp(periodo_fin)))].copy()
+            if not out.empty:
+                chunks.append(out)
+        file.seek(0)
+        return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente"])
+    except Exception:
+        file.seek(0)
+        return pd.DataFrame(columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente"])
+
 def read_any_file(file, sheet_name=None, preferred_sheets=None):
     """Lee Excel/CSV/TXT. Soporta TXT tipo SAP con tuberías."""
     if file is None:
@@ -970,8 +1129,15 @@ def vac_divisor_for_area(area):
     return 365.0
 
 
-def normalize_generic_concept_file(file, fuente, periodo_ini=None, periodo_fin=None, sheet_name=None):
-    """Lector de pagos/devengos flexible. Devuelve SAP, Concepto, Texto_Concepto, Valor, Fecha_Pago, Fuente."""
+def normalize_generic_concept_file(file, fuente, periodo_ini=None, periodo_fin=None, sheet_name=None, filter_concepts=None):
+    """Lector de pagos/devengos flexible. Devuelve SAP, Concepto, Texto_Concepto, Valor, Fecha_Pago, Fuente.
+
+    Para TXT/CSV grandes usa lectura liviana/chunks y, si se envía filter_concepts,
+    solo conserva conceptos relevantes para no reventar memoria en Streamlit Cloud.
+    """
+    name = getattr(file, "name", "").lower() if file is not None else ""
+    if file is not None and name.endswith((".txt", ".csv")) and uploaded_size_mb(file) >= 80:
+        return _large_text_to_concepts(file, fuente, periodo_ini=periodo_ini, periodo_fin=periodo_fin, filter_concepts=filter_concepts)
     df = read_any_file(file, sheet_name=sheet_name)
     if df.empty:
         return pd.DataFrame(columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente"])
@@ -997,7 +1163,10 @@ def normalize_generic_concept_file(file, fuente, periodo_ini=None, periodo_fin=N
         # Solo filtra cuando la fecha se pudo interpretar; si no, deja el registro para no perderlo.
         mask_date = out["Fecha_Pago"].notna()
         out = out[(~mask_date) | ((out["Fecha_Pago"] >= pd.Timestamp(periodo_ini)) & (out["Fecha_Pago"] <= pd.Timestamp(periodo_fin)))].copy()
-    return out[(out["SAP"] != "") & (out["Concepto"] != "") & (out["Valor"] != 0)].copy()
+    out = out[(out["SAP"] != "") & (out["Concepto"] != "") & (out["Valor"] != 0)].copy()
+    if filter_concepts:
+        out = out[out["Concepto"].isin(set(filter_concepts))].copy()
+    return out
 
 
 def dkon_flags_by_concept(dkon):
@@ -1300,7 +1469,8 @@ def build_prestaciones_bases(base, md, dkon, cwtr_file=None, hist_file=None, par
     sem_ini = semester_start(eval_date)
     year_ini = year_start(eval_date)
     dkon_flags = dkon_flags_by_concept(dkon)
-    cwtr = normalize_generic_concept_file(cwtr_file, "CWTR acumulados") if cwtr_file else pd.DataFrame(columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente"])
+    valid_prest_concepts = set(dkon_flags.loc[dkon_flags["Base_Prestaciones"].map(yes_no), "Concepto"].astype(str)) if not dkon_flags.empty else set()
+    cwtr = normalize_generic_concept_file(cwtr_file, "CWTR acumulados", filter_concepts=valid_prest_concepts) if cwtr_file else pd.DataFrame(columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente"])
     if not cwtr.empty:
         cwtr = cwtr.merge(dkon_flags, on="Concepto", how="left")
         for c in ["Base_SS","Ley_1393","Base_Parafiscales","Base_Vacaciones","Base_Prestaciones"]:
@@ -1372,23 +1542,59 @@ def read_simple_value_by_sap(file, value_names, sheet_name=None):
     return pd.DataFrame({"SAP":df[c_sap].map(to_sap), "Valor":df[c_val].map(to_number)}).groupby("SAP", as_index=False)["Valor"].sum()
 
 
-def calculate_vacaciones_base(dkon, md_act, md_ant, prov_ant_file, pagos_actual_file, pagos_anio_ant_file, params=None):
+def calculate_vacaciones_base(dkon, md_act, md_ant, prov_ant_file, base_calculo_actual, pagos_anio_ant_file, params=None):
+    """Calcula base móvil de vacaciones.
+
+    Importante: los pagos Base Vacaciones del mes actual NO los carga el usuario.
+    Salen de BASE_CALCULO_PROYECCION, porque son los pagos que se están proyectando
+    en el Módulo 1. El usuario solo carga el mismo mes del año anterior para retirar
+    ese mes de la ventana móvil de 12 meses.
+    """
     params = params or {}
     dkon_flags = dkon_flags_by_concept(dkon)
     prov = read_simple_value_by_sap(prov_ant_file, ["Base vacaciones mes anterior", "Base_Vacaciones_Mes_Anterior", "Base Vacaciones", "Vacaciones_Ant", "Vacaciones Ant"]) if prov_ant_file else pd.DataFrame(columns=["SAP","Valor"])
     prov = prov.rename(columns={"Valor":"Base_Vacaciones_Mes_Anterior"})
-    pagos_act = normalize_generic_concept_file(pagos_actual_file, "Pagos vacaciones mes actual") if pagos_actual_file else pd.DataFrame()
-    pagos_old = normalize_generic_concept_file(pagos_anio_ant_file, "Pagos vacaciones mismo mes año anterior") if pagos_anio_ant_file else pd.DataFrame()
+    valid_vac_concepts = set(dkon_flags.loc[dkon_flags["Base_Vacaciones"].map(yes_no), "Concepto"].astype(str)) if not dkon_flags.empty else set()
+
+    # Mes actual: sale del cálculo proyectado. Se excluyen conceptos de salario base,
+    # porque el salario mes actual se suma por separado desde MD.
+    if base_calculo_actual is not None and not base_calculo_actual.empty:
+        pagos_act = base_calculo_actual.copy()
+        for c in ["SAP", "Concepto", "Texto_Concepto", "Valor", "Fuente"]:
+            if c not in pagos_act.columns:
+                pagos_act[c] = "" if c != "Valor" else 0
+        pagos_act["Concepto"] = pagos_act["Concepto"].map(to_concept)
+        pagos_act["Valor"] = pagos_act["Valor"].map(to_number)
+        if "Base_Vacaciones" in pagos_act.columns:
+            mask_vac = pagos_act["Base_Vacaciones"].apply(lambda v: bool(v) if isinstance(v, (bool, np.bool_)) else yes_no(v) == "SI")
+        else:
+            mask_vac = pagos_act["Concepto"].isin(valid_vac_concepts)
+        pagos_act = pagos_act[mask_vac & (~pagos_act["Concepto"].isin(BASIC_SALARY_CONCEPTS)) & (pagos_act["Valor"] != 0)].copy()
+        pagos_act["Fecha_Pago"] = params.get("periodo_fin", pd.NaT)
+        pagos_act["Fuente"] = "Base cálculo proyectada - mes actual"
+        pagos_act = pagos_act[["SAP", "Concepto", "Texto_Concepto", "Valor", "Fecha_Pago", "Fuente"]]
+    else:
+        pagos_act = pd.DataFrame(columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente"])
+
+    # Año anterior: sí lo carga el usuario para restar el mes que sale de los 12 meses.
+    pagos_old = normalize_generic_concept_file(pagos_anio_ant_file, "Pagos vacaciones mismo mes año anterior", filter_concepts=valid_vac_concepts) if pagos_anio_ant_file else pd.DataFrame()
+
     def prep_pagos(df, label):
         if df.empty:
-            return pd.DataFrame(columns=["SAP","Variable"]), pd.DataFrame()
-        x = df.merge(dkon_flags[["Concepto","Base_Vacaciones"]], on="Concepto", how="left")
+            return pd.DataFrame(columns=["SAP","Variable"]), pd.DataFrame(columns=["SAP","Concepto","Texto_Concepto","Valor","Fecha_Pago","Fuente","Base_Vacaciones","Entra_Vacaciones","Motivo"])
+        x = df.copy()
+        x["Concepto"] = x["Concepto"].map(to_concept)
+        x = x.merge(dkon_flags[["Concepto","Base_Vacaciones"]], on="Concepto", how="left", suffixes=("", "_DKON"))
         x["Base_Vacaciones"] = x["Base_Vacaciones"].fillna("NO").map(yes_no)
         x["Entra_Vacaciones"] = np.where(x["Base_Vacaciones"].eq("SI"), "SI", "NO")
-        x["Motivo"] = np.where(x["Entra_Vacaciones"].eq("SI"), "Concepto DKON Base Vacaciones = SI", "No marcado Base Vacaciones en DKON")
+        x["Motivo"] = np.where(x["Entra_Vacaciones"].eq("SI"), f"{label}: concepto DKON Base Vacaciones = SI", f"{label}: no marcado Base Vacaciones en DKON")
+        if label == "Actual proyectado":
+            x.loc[x["Concepto"].isin(BASIC_SALARY_CONCEPTS), "Entra_Vacaciones"] = "NO"
+            x.loc[x["Concepto"].isin(BASIC_SALARY_CONCEPTS), "Motivo"] = "Salario base excluido de variable; salario actual se suma desde MD"
         s = x[x["Entra_Vacaciones"].eq("SI")].groupby("SAP", as_index=False)["Valor"].sum().rename(columns={"Valor":"Variable"})
         return s, x
-    var_act, rast_act = prep_pagos(pagos_act, "Actual")
+
+    var_act, rast_act = prep_pagos(pagos_act, "Actual proyectado")
     var_old, rast_old = prep_pagos(pagos_old, "Año anterior")
     act = md_act[["SAP","Nombre","CECO","Tipo_CECO","Area_Nomina","Cargo","Salario_Total_MD"]].copy().rename(columns={"Salario_Total_MD":"Salario_Mes_Actual"}) if not md_act.empty else pd.DataFrame()
     ant = md_ant[["SAP","Salario_Total_MD"]].copy().rename(columns={"Salario_Total_MD":"Salario_Mes_Anterior"}) if not md_ant.empty else pd.DataFrame(columns=["SAP","Salario_Mes_Anterior"])
@@ -1401,6 +1607,8 @@ def calculate_vacaciones_base(dkon, md_act, md_ant, prov_ant_file, pagos_actual_
     out["Base_Vacaciones_Actual"] = out["Base_Vacaciones_Mes_Anterior"] - out["Salario_Mes_Anterior"] - out["Variable_Mismo_Mes_Anio_Ant_Mensualizada"] + out["Variable_Mes_Actual_Mensualizada"] + out["Salario_Mes_Actual"]
     alerts=[]
     alerts += [{"Tipo":"Vacaciones", "Severidad":"Alta", "SAP":r["SAP"], "Detalle":"Sin base/provisión vacaciones mes anterior", "Valor":0} for _, r in out[out["Base_Vacaciones_Mes_Anterior"].eq(0)].iterrows()]
+    if pagos_act.empty:
+        alerts.append({"Tipo":"Vacaciones", "Severidad":"Media", "SAP":"", "Detalle":"No se encontraron pagos proyectados del mes actual marcados Base Vacaciones = SI en el Módulo 1.", "Valor":0})
     return {"BASE_VACACIONES_CALCULO": out, "RASTREO_VARIABLE_ACTUAL": rast_act, "RASTREO_VARIABLE_ANIO_ANT": rast_old, "ALERTAS_VACACIONES": pd.DataFrame(alerts)}
 
 
