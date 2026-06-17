@@ -1,2 +1,2 @@
-zlib1g-dev
-libjpeg-dev
+libxml2
+libxslt1.1
